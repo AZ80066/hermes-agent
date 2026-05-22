@@ -14,6 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -2891,6 +2892,198 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def _render_kopa_action_card(self, action: str, *, data: str, message_id: Any, evidence_path: Any) -> Dict[str, Any]:
+        """Render a deterministic KopaOS Command Deck action result.
+
+        These callbacks are intentionally not LLM-powered: a Telegram button
+        tap must return quickly, record auditable evidence, and avoid claiming
+        product delivery when the action is only a gateway-level projection.
+        """
+        cards: Dict[str, Dict[str, Any]] = {
+            "status": {
+                "heading": "Kopa 状态卡",
+                "body": [
+                    "一句话结论：Command Deck action dispatcher 已接管本次点击，不是仅回执。",
+                    "进展证据：gateway 捕获 callback_data，并写入 profile-safe JSONL。",
+                    "验收状态：这是 runtime 状态投影；不等同于业务交付完成。",
+                ],
+            },
+            "delivery_card": {
+                "heading": "Kopa 交付卡",
+                "body": [
+                    "一句话结论：交付卡已生成；不是仅回执。",
+                    "进展证据：保留来源 deck message_id、action 与 evidence path。",
+                    "验收状态：仅报告可见证据，不把未配装内容包装成已交付。",
+                ],
+            },
+            "prs": {
+                "heading": "Kopa PR 状态入口",
+                "body": [
+                    "一句话结论：PR 入口已响应；不是仅回执。",
+                    "进展证据：当前首版提供确定性入口，后续可接 GitHub read model。",
+                    "验收状态：未执行 merge/review 等外部副作用。",
+                ],
+            },
+            "risks": {
+                "heading": "Kopa 风险卡",
+                "body": [
+                    "一句话结论：风险卡已响应；不是仅回执。",
+                    "风险阻塞：首版只做确定性投影，不在 callback 内跑长耗时 LLM。",
+                    "下一步：如需实时风险聚合，接入 WorkFeed/Kanban read model。",
+                ],
+            },
+            "next": {
+                "heading": "Kopa 下一步",
+                "body": [
+                    "一句话结论：下一步卡已响应；不是仅回执。",
+                    "下一步：按 Issue → Branch → Test → PR → Smoke 的研发链路推进。",
+                    "边界：TG 不是 bot-to-bot 事件总线，后续动作需回到主链路证据面。",
+                ],
+            },
+            "retro": {
+                "heading": "Kopa 复盘卡",
+                "body": [
+                    "一句话结论：复盘卡已响应；不是仅回执。",
+                    "复盘口径：区分工程实现、runtime 配装、Telegram 可见证据与验收。",
+                    "下一步：将稳定经验沉淀到 AZ-Workflow/技能，不记录短期状态进 memory。",
+                ],
+            },
+        }
+
+        if action not in cards:
+            heading = "Kopa 暂未支持的 action"
+            text = (
+                f"⚠️ {heading}\n"
+                f"一句话结论：暂未支持 `{action}`，已 fail-closed，未触发外部副作用。\n"
+                f"证据：message_id={message_id or 'unknown'} · callback_data={data}\n"
+                f"evidence={evidence_path}"
+            )
+            return {
+                "status": "unsupported",
+                "heading": heading,
+                "text": text,
+                "side_effects": [],
+            }
+
+        card = cards[action]
+        heading = card["heading"]
+        lines = [f"✅ {heading}", *card["body"]]
+        lines.append(f"证据：message_id={message_id or 'unknown'} · callback_data={data}")
+        lines.append(f"evidence={evidence_path}")
+        return {
+            "status": "rendered",
+            "heading": heading,
+            "text": "\n".join(lines),
+            "side_effects": ["telegram_receipt", "jsonl_evidence"],
+        }
+
+    async def _handle_kopa_callback_query(
+        self,
+        *,
+        query: Any,
+        data: str,
+        update_id: Optional[int],
+        query_chat_id: Any,
+        query_chat_type: Optional[str],
+        query_thread_id: Any,
+        query_user_name: Optional[str],
+    ) -> None:
+        """Handle KopaOS Command Deck callbacks (``kopa:<action>``)."""
+        caller_id = str(getattr(getattr(query, "from_user", None), "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=query_chat_type,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this Kopa action.")
+            return
+
+        message = getattr(query, "message", None)
+        chat_id = query_chat_id or getattr(message, "chat_id", None)
+        message_id = getattr(message, "message_id", None)
+        action = data.split(":", 1)[1] if ":" in data else ""
+
+        try:
+            from hermes_constants import get_hermes_home
+            events_dir = get_hermes_home() / "events"
+            events_dir.mkdir(parents=True, exist_ok=True)
+            evidence_path = events_dir / "telegram_kopa_callbacks.jsonl"
+        except Exception:
+            evidence_path = None
+
+        action_result = self._render_kopa_action_card(
+            action,
+            data=data,
+            message_id=message_id,
+            evidence_path=evidence_path or "unavailable",
+        )
+
+        if evidence_path is not None:
+            try:
+                evidence = {
+                    "schema_version": "telegram_kopa_callback_v1",
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "platform": "telegram",
+                    "adapter": self.name,
+                    "update_id": update_id,
+                    "callback_query_id": str(getattr(query, "id", "")),
+                    "callback_data": data,
+                    "action": action,
+                    "action_result": {
+                        "status": action_result["status"],
+                        "heading": action_result["heading"],
+                        "side_effects": action_result["side_effects"],
+                    },
+                    "from_user_id": caller_id,
+                    "from_user_name": query_user_name,
+                    "chat_id": str(chat_id) if chat_id is not None else None,
+                    "chat_type": query_chat_type,
+                    "thread_id": str(query_thread_id) if query_thread_id is not None else None,
+                    "message_id": str(message_id) if message_id is not None else None,
+                }
+                with evidence_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(evidence, ensure_ascii=False) + "\n")
+                logger.info(
+                    "Telegram Kopa action callback: data=%s action=%s status=%s chat_id=%s thread_id=%s message_id=%s evidence=%s",
+                    data,
+                    action,
+                    action_result["status"],
+                    chat_id,
+                    query_thread_id,
+                    message_id,
+                    evidence_path,
+                )
+            except Exception as exc:
+                logger.error("[%s] Failed to record Kopa callback evidence: %s", self.name, exc, exc_info=True)
+
+        if action_result["status"] == "unsupported":
+            await query.answer(text=f"Kopa 暂未支持：{action or data}")
+        else:
+            await query.answer(text=f"Kopa 已执行：{action}")
+
+        if not self._bot or chat_id is None:
+            return
+
+        try:
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": action_result["text"],
+                **self._link_preview_kwargs(),
+            }
+            if query_thread_id is not None:
+                send_kwargs.update(
+                    self._thread_kwargs_for_send(
+                        str(chat_id),
+                        str(query_thread_id),
+                        {"thread_id": str(query_thread_id)},
+                    )
+                )
+            await self._send_message_with_thread_fallback(**send_kwargs)
+        except Exception as exc:
+            logger.error("[%s] Failed to send Kopa action card: %s", self.name, exc, exc_info=True)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -2920,6 +3113,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 data,
                 query_chat_id=query_chat_id,
                 query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- KopaOS Command Deck callbacks (kopa:<action>) ---
+        if data.startswith("kopa:"):
+            await self._handle_kopa_callback_query(
+                query=query,
+                data=data,
+                update_id=getattr(update, "update_id", None),
+                query_chat_id=query_chat_id,
+                query_chat_type=str(query_chat_type) if query_chat_type is not None else None,
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )

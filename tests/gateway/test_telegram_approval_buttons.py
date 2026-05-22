@@ -1,6 +1,7 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -589,3 +590,86 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+
+class TestTelegramKopaActionCallback:
+    """KopaOS Command Deck actions route to deterministic action cards."""
+
+    def _query(self, data="kopa:status"):
+        query = MagicMock()
+        query.id = "cb-1"
+        query.data = data
+        query.from_user = SimpleNamespace(id="7245435239", first_name="Az")
+        query.answer = AsyncMock()
+        query.message = SimpleNamespace(
+            chat_id=-1003874719298,
+            message_id=3706,
+            message_thread_id=3609,
+            chat=SimpleNamespace(type="supergroup"),
+        )
+        return query
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data", "expected_action", "expected_heading"),
+        [
+            ("kopa:status", "status", "Kopa 状态卡"),
+            ("kopa:delivery_card", "delivery_card", "Kopa 交付卡"),
+            ("kopa:prs", "prs", "Kopa PR 状态入口"),
+            ("kopa:risks", "risks", "Kopa 风险卡"),
+            ("kopa:next", "next", "Kopa 下一步"),
+            ("kopa:retro", "retro", "Kopa 复盘卡"),
+        ],
+    )
+    async def test_kopa_known_actions_send_distinct_cards_and_record_action_result(
+        self, tmp_path, data, expected_action, expected_heading
+    ):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=99))
+        query = self._query(data)
+        update = SimpleNamespace(update_id=123, callback_query=query)
+
+        with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+            with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+                await adapter._handle_callback_query(update, SimpleNamespace())
+
+        query.answer.assert_awaited_once_with(text=f"Kopa 已执行：{expected_action}")
+        adapter._bot.send_message.assert_awaited_once()
+        sent = adapter._bot.send_message.call_args[1]
+        assert sent["chat_id"] == -1003874719298
+        assert sent["message_thread_id"] == 3609
+        assert expected_heading in sent["text"]
+        assert "message_id=3706" in sent["text"]
+        assert data in sent["text"]
+        assert "不是仅回执" in sent["text"]
+
+        evidence_path = tmp_path / "events" / "telegram_kopa_callbacks.jsonl"
+        record = json.loads(evidence_path.read_text(encoding="utf-8").splitlines()[-1])
+        assert record["schema_version"] == "telegram_kopa_callback_v1"
+        assert record["callback_data"] == data
+        assert record["action"] == expected_action
+        assert record["action_result"]["status"] == "rendered"
+        assert record["action_result"]["heading"] == expected_heading
+        assert record["message_id"] == "3706"
+
+    @pytest.mark.asyncio
+    async def test_kopa_unknown_action_fails_closed_but_records_evidence(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=100))
+        query = self._query("kopa:unknown")
+        update = SimpleNamespace(update_id=124, callback_query=query)
+
+        with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+            with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+                await adapter._handle_callback_query(update, SimpleNamespace())
+
+        query.answer.assert_awaited_once_with(text="Kopa 暂未支持：unknown")
+        sent = adapter._bot.send_message.call_args[1]
+        assert "暂未支持" in sent["text"]
+        assert "未触发外部副作用" in sent["text"]
+
+        evidence_path = tmp_path / "events" / "telegram_kopa_callbacks.jsonl"
+        record = json.loads(evidence_path.read_text(encoding="utf-8").splitlines()[-1])
+        assert record["action"] == "unknown"
+        assert record["action_result"]["status"] == "unsupported"
+        assert record["action_result"]["side_effects"] == []
