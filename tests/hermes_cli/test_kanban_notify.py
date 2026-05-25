@@ -66,9 +66,9 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
             timeout=10.0,
         )
 
-    fake_adapter.send.assert_called_once()
-    call_msg = fake_adapter.send.call_args[0][1]
-    assert "completed" in call_msg
+    assert fake_adapter.send.call_count >= 1
+    call_msg = fake_adapter.send.call_args_list[-1][0][1]
+    assert "Issue/任务完成" in call_msg
 
     conn = kb.connect()
     try:
@@ -126,9 +126,16 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
             timeout=10.0,
         )
 
-    # The user is notified about the abnormal event...
-    fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    # The user is notified about the abnormal event. The runtime-receipt path
+    # may also send an earlier created/assigned lifecycle receipt first.
+    assert fake_adapter.send.call_count >= 1
+    terminal_msg = fake_adapter.send.call_args_list[-1][0][1]
+    if kind == "gave_up":
+        assert "多次启动失败" in terminal_msg
+    elif kind == "crashed":
+        assert "崩溃" in terminal_msg
+    else:
+        assert "超时" in terminal_msg
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
@@ -214,7 +221,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
+    blocked_deliveries = [m for m in delivered_msgs if "阻塞" in m or "blocked" in m]
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
     assert len(blocked_deliveries) == 2, (
@@ -428,7 +435,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
             timeout=10.0,
         )
 
-    fake_adapter.send.assert_called_once()
+    assert fake_adapter.send.call_count >= 1
     conn = kb.connect()
     try:
         subs = kb.list_notify_subs(conn, tid)
@@ -575,8 +582,10 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
             timeout=10.0,
         )
 
-    # The text completion notification fired.
-    assert len(sends) == 1
+    # The text completion notification fired. Runtime receipts may also include
+    # earlier created/assigned lifecycle messages.
+    assert len(sends) >= 1
+    assert "rendered the chart" in sends[-1][1]
     # The PNG rode the image-batch path.
     assert any("q3-revenue.png" in p for p in images_uploaded), images_uploaded
     # The PDF rode the document path.

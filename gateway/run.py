@@ -4575,11 +4575,12 @@ class GatewayRunner:
             return "default"
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll ``kanban_notify_subs`` and deliver lightweight receipts to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
+        stored cursor with kind in the receipt set (``created``, ``assigned``,
+        ``spawned``, ``heartbeat``, ``completed``, ``blocked``, ``gave_up``,
+        ``crashed``, ``timed_out``). Sends one lightweight text/emoji receipt
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. When a task reaches a terminal state
         (``completed`` / ``archived``), the subscription is removed.
@@ -4600,7 +4601,17 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        RECEIPT_KINDS = (
+            "created",
+            "assigned",
+            "spawned",
+            "heartbeat",
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4708,7 +4719,7 @@ class GatewayRunner:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=RECEIPT_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -4761,56 +4772,163 @@ class GatewayRunner:
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
+                        # Runtime-owned identity: attribute receipts to the
+                        # task assignee/runtime. Routine Kanban lifecycle
+                        # events stay lightweight text/emoji; image Feed is
+                        # reserved for milestone/blocker/evidence gates.
                         who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        owner = f"@{who}" if who else "@agent"
+                        if kind == "created":
+                            assignee = None
+                            status = None
+                            if ev.payload:
+                                assignee = ev.payload.get("assignee")
+                                status = ev.payload.get("status")
+                            event_owner = f"@{assignee}" if assignee else owner
+                            state = f" · {status}" if status else ""
+                            msg = (
+                                f"📌 Kanban 已派单\n\n"
+                                f"任务：{sub['task_id']} · {event_owner}{state}\n"
+                                f"范围：{title}\n"
+                                f"下一步：等待 runtime 开始执行"
+                            )
+                        elif kind == "assigned":
+                            assignee = None
+                            if ev.payload:
+                                assignee = ev.payload.get("assignee")
+                            event_owner = f"@{assignee}" if assignee else owner
+                            msg = (
+                                f"📌 Kanban 已分配\n\n"
+                                f"任务：{sub['task_id']} · {event_owner}\n"
+                                f"范围：{title}\n"
+                                f"下一步：等待 runtime 开始执行"
+                            )
+                        elif kind == "spawned":
+                            pid_text = ""
+                            if ev.payload and ev.payload.get("pid"):
+                                pid_text = f"\n运行：pid {ev.payload['pid']}"
+                            msg = (
+                                f"▶️ Runtime 已开始\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"范围：{title}{pid_text}\n"
+                                f"下一步：执行中，有阻塞/完成会继续回报"
+                            )
+                        elif kind == "heartbeat":
+                            note = "执行中"
+                            if ev.payload and ev.payload.get("note"):
+                                note = str(ev.payload["note"]).strip().splitlines()[0][:160]
+                            msg = (
+                                f"🔄 Runtime 进展\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"范围：{title}\n"
+                                f"进展：{note}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
                             # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
+                            # runs shipped. Telegram-facing cards are kept
+                            # short and Chinese; verbose worker handoffs stay
+                            # in Kanban comments/logs for audit.
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
-                                h = payload_summary.strip().splitlines()[0][:200]
-                                handoff = f"\n{h}"
+                                result = payload_summary.strip().splitlines()[0][:180]
                             elif task and task.result:
-                                r = task.result.strip().splitlines()[0][:160]
-                                handoff = f"\n{r}"
+                                result = task.result.strip().splitlines()[0][:160]
+                            else:
+                                result = "已完成"
+                            evidence_text = "\n".join(
+                                str(part or "")
+                                for part in (
+                                    title,
+                                    getattr(task, "body", None) if task else None,
+                                    getattr(task, "result", None) if task else None,
+                                    payload_summary,
+                                )
+                            )
+                            issue_nums = []
+                            for _match in re.finditer(r"(?:Issue\s*)?#(\d+)\b", evidence_text, re.I):
+                                num = _match.group(1)
+                                if num not in issue_nums:
+                                    issue_nums.append(num)
+                            pr_nums = []
+                            for _match in re.finditer(r"PR\s*#(\d+)\b", evidence_text, re.I):
+                                num = _match.group(1)
+                                if num not in pr_nums:
+                                    pr_nums.append(num)
+                            refs = []
+                            if issue_nums:
+                                refs.append("Issue " + ", ".join(f"#{n}" for n in issue_nums[:3]) + " 已完成")
+                            if pr_nums:
+                                refs.append("PR " + ", ".join(f"#{n}" for n in pr_nums[:3]))
+                            refs_line = "\n" + f"关联：{' / '.join(refs)}" if refs else ""
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"✅ Issue/任务完成\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"范围：{title}{refs_line}\n"
+                                f"结果：{result}\n"
+                                f"下一步：Kopa/PM 验证 PR/Issue/milestone"
                             )
                         elif kind == "blocked":
-                            reason = ""
+                            raw_reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                                raw_reason = str(ev.payload["reason"])
+                            pr_match = re.search(r"PR\s*#(\d+)", raw_reason, re.I)
+                            issue_match = re.search(r"Issue\s*#(\d+)", raw_reason, re.I)
+                            if not issue_match:
+                                issue_match = re.search(r"\bfor\s+#(\d+)", raw_reason, re.I)
+                            pr_issue = []
+                            if pr_match:
+                                pr_issue.append(f"PR #{pr_match.group(1)}")
+                            if issue_match:
+                                issue_num = issue_match.group(1)
+                                pr_issue.append(f"Issue #{issue_num}")
+                            refs = " / ".join(pr_issue) if pr_issue else "待补充"
+                            tests = "passed" if re.search(r"tests?\s+passed|passed", raw_reason, re.I) else "待确认"
+                            if "review-required" in raw_reason:
+                                header = "⏸ Kanban 阻塞 · 等待 Review"
+                                next_step = "Founder/reviewer 批准后 merge"
+                            else:
+                                header = "⏸ Kanban 阻塞 · 需处理"
+                                next_step = raw_reason[:120] if raw_reason else "查看 Kanban 日志"
+                            msg = (
+                                f"{header}\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"{refs}\n"
+                                f"范围：{title}\n"
+                                f"测试：{tests}\n"
+                                f"下一步：{next_step}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n错误：{str(ev.payload['error'])[:180]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"✖ Kanban 失败 · 多次启动失败\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"范围：{title}{err}\n"
+                                f"下一步：Kopa/PM 诊断 profile/token/worker"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"✖ Kanban 崩溃 · Worker 退出\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"范围：{title}\n"
+                                f"下一步：dispatcher 将重试，若重复失败需恢复"
                             )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"⏱ Kanban 超时 · 将重试\n\n"
+                                f"任务：{sub['task_id']} · {owner}\n"
+                                f"范围：{title}\n"
+                                f"限制：{limit}s\n"
+                                f"下一步：观察重试或拆小任务"
                             )
                         else:
                             continue
@@ -4822,22 +4940,48 @@ class GatewayRunner:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
+                            send_result = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
+                            if self._kanban_send_result_failed(send_result):
+                                raise RuntimeError(
+                                    self._kanban_send_failure_error(send_result)
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
+                            evidence_payload = {
+                                "work_item_id": sub["task_id"],
+                                "task_id": sub["task_id"],
+                                "runtime_profile": who,
+                                "assignee": who,
+                                "notifier_profile": notifier_profile,
+                                "platform": platform_str,
+                                "chat_id": sub["chat_id"],
+                                "thread_id": sub.get("thread_id") or "",
+                                "message_id": self._kanban_send_message_id(send_result),
+                                "source_event_id": ev.id,
+                                "source_event_kind": kind,
+                                "board": board_slug,
+                            }
+                            try:
+                                await asyncio.to_thread(
+                                    self._kanban_record_delivery_evidence,
+                                    sub,
+                                    evidence_payload,
+                                    ev.run_id,
+                                    board_slug,
+                                )
+                            except Exception as evidence_exc:
+                                logger.warning(
+                                    "kanban notifier: delivery evidence record failed for %s event %s on board %s: %s",
+                                    sub["task_id"], ev.id, board_slug, evidence_exc,
+                                )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
-                            # (or the legacy ``result`` field) as native
-                            # uploads. ``extract_local_files`` finds bare
-                            # absolute paths in the summary;
-                            # ``send_document`` / ``send_image_file`` uploads
-                            # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
+                            # (or the legacy ``result`` field) as native uploads.
                             if kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
@@ -4969,6 +5113,54 @@ class GatewayRunner:
         finally:
             conn.close()
 
+    @staticmethod
+    def _kanban_send_result_failed(send_result: Any) -> bool:
+        """Return True when adapter.send() explicitly reports non-delivery."""
+        if send_result is None:
+            return False
+        if isinstance(send_result, dict):
+            return send_result.get("success") is False
+        return getattr(send_result, "success", None) is False
+
+    @staticmethod
+    def _kanban_send_failure_error(send_result: Any) -> str:
+        """Extract a short adapter error from an explicit send failure result."""
+        if isinstance(send_result, dict):
+            error = send_result.get("error")
+        else:
+            error = getattr(send_result, "error", None)
+        return str(error or "adapter returned success=False")
+
+    @staticmethod
+    def _kanban_send_message_id(send_result: Any) -> Optional[str]:
+        """Extract a platform message id from adapter.send() results."""
+        if send_result is None:
+            return None
+        msg_id = getattr(send_result, "message_id", None)
+        if msg_id is None and isinstance(send_result, dict):
+            msg_id = send_result.get("message_id")
+        return str(msg_id) if msg_id is not None else None
+
+    def _kanban_record_delivery_evidence(
+        self,
+        sub: dict,
+        payload: dict,
+        run_id: Optional[int] = None,
+        board: Optional[str] = None,
+    ) -> None:
+        """Sync helper: append a kanban notification delivery evidence event."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.record_notify_delivery_evidence(
+                conn,
+                sub["task_id"],
+                payload,
+                run_id=run_id,
+            )
+        finally:
+            conn.close()
+
     async def _deliver_kanban_artifacts(
         self,
         *,
@@ -4978,22 +5170,7 @@ class GatewayRunner:
         event_payload: Optional[dict],
         task,
     ) -> None:
-        """Upload artifact files referenced by a completed kanban task.
-
-        Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
-        file paths through the completion event so downstream humans get
-        the deliverable as a native upload instead of a path printed in
-        chat.
-
-        Sources scanned, in priority order:
-          1. ``event_payload['artifacts']`` (explicit list — preferred)
-          2. ``event_payload['summary']`` (truncated first line)
-          3. ``task.result`` (legacy fallback)
-
-        Files are deduplicated, missing files are silently skipped (the
-        path may have been mentioned for reference only), and delivery
-        errors are logged but do not break the notifier loop.
-        """
+        """Upload artifact files referenced by a completed kanban task."""
         from pathlib import Path as _Path
 
         candidates: list[str] = []
@@ -5010,22 +5187,18 @@ class GatewayRunner:
             seen.add(expanded)
             candidates.append(expanded)
 
-        # 1. Explicit artifacts list in payload.
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
             if isinstance(raw, (list, tuple)):
                 for item in raw:
                     if isinstance(item, str):
                         _add(item)
-
-            # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
                 paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
                     _add(p)
 
-        # 3. Legacy: paths embedded in task.result.
         if task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
@@ -5042,11 +5215,8 @@ class GatewayRunner:
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-
         from urllib.parse import quote as _quote
 
-        # Partition images so they ride a single send_multiple_images call
-        # on platforms that support batch image uploads (Signal/Slack RPCs).
         image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
 
@@ -5057,26 +5227,17 @@ class GatewayRunner:
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )
             except Exception as exc:
-                logger.warning(
-                    "kanban notifier: image batch upload failed: %s", exc,
-                )
+                logger.warning("kanban notifier: image batch upload failed: %s", exc)
 
         for path in other_paths:
             ext = _Path(path).suffix.lower()
             try:
                 if ext in _VIDEO_EXTS:
-                    await adapter.send_video(
-                        chat_id=chat_id, video_path=path, metadata=metadata,
-                    )
+                    await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
                 else:
-                    await adapter.send_document(
-                        chat_id=chat_id, file_path=path, metadata=metadata,
-                    )
+                    await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
             except Exception as exc:
-                logger.warning(
-                    "kanban notifier: artifact upload (%s) failed: %s",
-                    path, exc,
-                )
+                logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

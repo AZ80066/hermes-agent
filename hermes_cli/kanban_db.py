@@ -6130,6 +6130,30 @@ def rewind_notify_cursor(
     return cur.rowcount > 0
 
 
+def record_notify_delivery_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict,
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Persist gateway delivery evidence for a kanban notification receipt.
+
+    The gateway notifier uses this as an audit ledger for routine lifecycle
+    receipts. It intentionally writes a distinct event kind that is *not* in
+    the notifier's receipt set, so recording the evidence cannot recursively
+    trigger another outbound notification.
+    """
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "notify_delivery_evidence",
+            dict(payload or {}),
+            run_id=run_id,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Retention + garbage collection
 # ---------------------------------------------------------------------------
