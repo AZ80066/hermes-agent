@@ -82,6 +82,27 @@ def test_run_slash_no_args_shows_usage(kanban_home):
     assert "create" in out.lower() or "subcommand" in out.lower() or "action" in out.lower()
 
 
+def test_run_slash_health_json_reports_ok(kanban_home):
+    out = kc.run_slash("health --json")
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["quick_check"] == "ok"
+    assert payload["notify_subs"]["ok"] is True
+
+
+def test_run_slash_backup_creates_quickcheck_ok_copy(kanban_home, tmp_path):
+    out = kc.run_slash("create 'backup me'")
+    assert "Created" in out
+    backup_path = tmp_path / "kanban-backup.db"
+
+    out = kc.run_slash(f"backup {backup_path}")
+
+    assert str(backup_path) in out
+    with kb.connect(backup_path) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert [t.title for t in kb.list_tasks(conn)] == ["backup me"]
+
+
 def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("create 'ship feature' --assignee alice")
     assert "Created" in out
