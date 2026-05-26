@@ -1089,6 +1089,23 @@ _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
+_NOTIFY_SUBS_REQUIRED_COLUMNS = {
+    "task_id",
+    "platform",
+    "chat_id",
+    "thread_id",
+    "user_id",
+    "notifier_profile",
+    "last_event_id",
+    "created_at",
+}
+_NOTIFY_SUBS_RECOVERY_HINT = (
+    "Notification subscription table is unavailable; core kanban task "
+    "execution/readback remains usable, but gateway receipts are disabled. "
+    "Run `hermes kanban init` to recreate additive schema, then re-subscribe "
+    "the affected chat/topic with `/kanban subscribe` or the dashboard "
+    "home subscribe action."
+)
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -1187,6 +1204,125 @@ def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
         and minor in {0x00, 0x01, 0x02, 0x03, 0x04}
         and 0 < length <= 18432
     )
+
+
+def _notify_subs_health(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return health for optional gateway notification subscriptions.
+
+    Notification rows are convenience delivery state, not the Kanban task
+    source of truth. A missing/malformed ``kanban_notify_subs`` table should
+    disable receipts with a recovery hint instead of breaking task readback or
+    dispatcher execution.
+    """
+    try:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='kanban_notify_subs'"
+        ).fetchone()
+        if table is None:
+            return {
+                "ok": False,
+                "table_exists": False,
+                "missing_columns": sorted(_NOTIFY_SUBS_REQUIRED_COLUMNS),
+                "row_count": None,
+                "recovery_hint": _NOTIFY_SUBS_RECOVERY_HINT,
+            }
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
+        missing = sorted(_NOTIFY_SUBS_REQUIRED_COLUMNS - columns)
+        row_count = None
+        if not missing:
+            row_count = int(conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0])
+        return {
+            "ok": not missing,
+            "table_exists": True,
+            "missing_columns": missing,
+            "row_count": row_count,
+            "recovery_hint": None if not missing else _NOTIFY_SUBS_RECOVERY_HINT,
+        }
+    except sqlite3.DatabaseError as exc:
+        return {
+            "ok": False,
+            "table_exists": None,
+            "missing_columns": sorted(_NOTIFY_SUBS_REQUIRED_COLUMNS),
+            "row_count": None,
+            "error": str(exc),
+            "recovery_hint": _NOTIFY_SUBS_RECOVERY_HINT,
+        }
+
+
+def check_board_health(
+    conn: sqlite3.Connection,
+    *,
+    integrity_check: bool = False,
+) -> dict[str, Any]:
+    """Run deterministic Kanban board health checks.
+
+    ``quick_check`` is always run as the lightweight watchdog signal.
+    ``integrity_check`` can be enabled for heavier post-recovery evidence.
+    Notification subscription state is reported separately because it is a
+    gateway receipt layer; failures there should not be mistaken for core
+    task/readback corruption.
+    """
+    report: dict[str, Any] = {
+        "ok": True,
+        "quick_check": None,
+        "integrity_check": None,
+        "notify_subs": None,
+        "errors": [],
+    }
+    try:
+        quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+        report["quick_check"] = quick
+        if quick.lower() != "ok":
+            report["ok"] = False
+            report["errors"].append(f"quick_check={quick}")
+    except sqlite3.DatabaseError as exc:
+        report["ok"] = False
+        report["quick_check"] = "error"
+        report["errors"].append(f"quick_check failed: {exc}")
+
+    if integrity_check:
+        try:
+            integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+            report["integrity_check"] = integrity
+            if integrity.lower() != "ok":
+                report["ok"] = False
+                report["errors"].append(f"integrity_check={integrity}")
+        except sqlite3.DatabaseError as exc:
+            report["ok"] = False
+            report["integrity_check"] = "error"
+            report["errors"].append(f"integrity_check failed: {exc}")
+
+    notify = _notify_subs_health(conn)
+    report["notify_subs"] = notify
+    if not notify.get("ok"):
+        report["ok"] = False
+        report["errors"].append("notify_subs unavailable")
+    return report
+
+
+def backup_board_db(
+    conn: sqlite3.Connection,
+    destination: Path,
+    *,
+    pages: int = 0,
+) -> Path:
+    """Create a safe online SQLite backup of a Kanban board DB.
+
+    Uses SQLite's backup API so callers do not copy DB/WAL/SHM sidecars while
+    writers may be active. The destination is verified with ``quick_check``
+    before being returned.
+    """
+    dest = Path(destination)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(dest)) as out:
+        conn.backup(out, pages=pages)
+        quick = str(out.execute("PRAGMA quick_check").fetchone()[0])
+        if quick.lower() != "ok":
+            raise sqlite3.DatabaseError(
+                f"backup quick_check failed for {dest}: {quick}"
+            )
+    return dest
 
 
 def _validate_sqlite_header(path: Path) -> None:
@@ -6990,12 +7126,20 @@ def add_notify_sub(
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
-    if task_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
+    try:
+        if task_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
+    except sqlite3.DatabaseError as exc:
+        _log.warning(
+            "kanban notify subscriptions unavailable; receipts disabled until "
+            "schema is repaired/re-subscribed: %s",
+            exc,
+        )
+        return []
     return [dict(r) for r in rows]
 
 
