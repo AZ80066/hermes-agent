@@ -69,6 +69,52 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
 
 
+def test_board_health_reports_sqlite_and_notify_sub_schema(kanban_home):
+    with kb.connect() as conn:
+        report = kb.check_board_health(conn)
+
+    assert report["ok"] is True
+    assert report["quick_check"] == "ok"
+    assert report["integrity_check"] is None
+    notify = report["notify_subs"]
+    assert notify["ok"] is True
+    assert notify["table_exists"] is True
+    assert notify["missing_columns"] == []
+    assert notify["recovery_hint"] is None
+
+
+def test_board_health_flags_notify_sub_schema_without_breaking_tasks(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="core execution survives")
+        conn.execute("DROP TABLE kanban_notify_subs")
+
+        report = kb.check_board_health(conn)
+        task = kb.get_task(conn, tid)
+        subs = kb.list_notify_subs(conn)
+
+    assert task is not None
+    assert task.title == "core execution survives"
+    assert subs == []
+    assert report["ok"] is False
+    assert report["quick_check"] == "ok"
+    assert report["notify_subs"]["ok"] is False
+    assert report["notify_subs"]["table_exists"] is False
+    assert "hermes kanban init" in report["notify_subs"]["recovery_hint"]
+
+
+def test_backup_kanban_db_uses_sqlite_online_backup(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="back me up")
+        backup_path = kb.backup_board_db(conn, tmp_path / "snapshots" / "kanban.db.bak")
+
+    assert backup_path == tmp_path / "snapshots" / "kanban.db.bak"
+    with sqlite3.connect(str(backup_path)) as backup:
+        backup.row_factory = sqlite3.Row
+        assert backup.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        row = backup.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["title"] == "back me up"
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 

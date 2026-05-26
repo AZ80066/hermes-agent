@@ -455,6 +455,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    # --- deterministic DB durability checks ---
+    p_health = sub.add_parser(
+        "health",
+        help="Run Kanban DB quick_check/integrity_check and notify-subscription health checks",
+    )
+    p_health.add_argument(
+        "--integrity", action="store_true",
+        help="Also run full PRAGMA integrity_check (slower than quick_check)",
+    )
+    p_health.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON instead of a concise human summary",
+    )
+    p_backup = sub.add_parser(
+        "backup",
+        help="Create a safe SQLite online backup of the current Kanban DB",
+    )
+    p_backup.add_argument("destination", help="Destination .db path for the backup")
+
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
         "diagnostics",
@@ -888,6 +907,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         "assign":   _cmd_assign,
         "reclaim":  _cmd_reclaim,
         "reassign": _cmd_reassign,
+        "health":   _cmd_health,
+        "backup":   _cmd_backup,
         "diagnostics": _cmd_diagnostics,
         "diag":     _cmd_diagnostics,
         "link":     _cmd_link,
@@ -1621,6 +1642,38 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         f"{profile or '(unassigned)'}"
         + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
     )
+    return 0
+
+
+def _cmd_health(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        report = kb.check_board_health(
+            conn,
+            integrity_check=bool(getattr(args, "integrity", False)),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report.get("ok") else 1
+    marker = "ok" if report.get("ok") else "FAILED"
+    print(f"Kanban DB health: {marker}")
+    print(f"  quick_check: {report.get('quick_check')}")
+    if report.get("integrity_check") is not None:
+        print(f"  integrity_check: {report.get('integrity_check')}")
+    notify = report.get("notify_subs") or {}
+    print(
+        "  notify_subs: "
+        + ("ok" if notify.get("ok") else "unavailable")
+    )
+    if notify.get("recovery_hint"):
+        print(f"  recovery: {notify['recovery_hint']}")
+    return 0 if report.get("ok") else 1
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    dest = Path(args.destination).expanduser()
+    with kb.connect() as conn:
+        out = kb.backup_board_db(conn, dest)
+    print(f"Kanban DB backup created: {out}")
     return 0
 
 
