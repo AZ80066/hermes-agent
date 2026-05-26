@@ -3407,8 +3407,33 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return
 
+        # --- KopaOS Sourcebot Command Deck callbacks (kopa:<action>) ---
+        if data.startswith("kopa:"):
+            await self._handle_kopa_command_deck_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- KopaOS decision-inbox callbacks (kd:v1:<action>:<nonce>) ---
+        if data.startswith("kd:v1:"):
+            await self._handle_kopa_decision_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
+            await query.answer(text="⚠️ 这个按钮当前没有可用处理器。")
             return
         answer = data.split(":", 1)[1]  # "y" or "n"
         caller_id = str(getattr(query.from_user, "id", ""))
@@ -3444,6 +3469,391 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    # ------------------------------------------------------------------
+    # KopaOS Sourcebot Command Deck (local runtime adapter)
+    # ------------------------------------------------------------------
+
+    def _is_kopa_command_deck_summon(self, text: str) -> bool:
+        token = (text or "").strip().split()[0].split("@", 1)[0].lower()
+        return token in {"/kopa", "/deck", "/菜单"}
+
+    def _is_kopa_decision_command(self, text: str) -> bool:
+        token = (text or "").strip().split()[0].split("@", 1)[0].lower()
+        return token == "/kopa_decision"
+
+    def _kopa_decision_state_dir(self) -> _Path:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "kopaos" / "surface-events" / "decision-state"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _build_kopa_decision_event(self, decision_id: str) -> Dict[str, Any]:
+        now = datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "_", decision_id)
+        return {
+            "schema_version": "surface_event_v1",
+            "event_id": f"evt_decision_command_{safe_suffix}",
+            "event_type": "decision_required",
+            "timestamp": now,
+            "source_runtime": "github",
+            "source_object_id": decision_id,
+            "severity": "warning",
+            "target_surfaces": [
+                {
+                    "surface": "founder_feed",
+                    "logical_route": {
+                        "container": "kopaos-workspace",
+                        "topic": "decision-inbox",
+                        "route_key": "surface.decision-inbox.decision_required",
+                    },
+                    "delivery_target": {
+                        "kind": "logical_surface",
+                        "logical_id": "surface.decision-inbox",
+                        "runtime_resolved": False,
+                    },
+                }
+            ],
+            "payload": {
+                "title": "KopaOS decision command",
+                "requested_by": "Founder",
+                "decision_question": f"Record decision action for {decision_id}",
+                "recommended_default": "Use the explicit Founder command action",
+                "default_risk": "Telegram is projection evidence; source-of-truth state writeback remains separate",
+                "command_path": "/kopa_decision OWNER/REPO#NUMBER ACTION reason=...",
+            },
+            "dedup_key": f"decision-required-{safe_suffix}",
+            "audit_context": {
+                "evidence_handle": {
+                    "source_system": "github",
+                    "source_type": "issue",
+                    "source_id": decision_id,
+                    "url": f"https://github.com/{decision_id.replace('#', '/issues/')}",
+                    "observed_at": now,
+                },
+                "source_of_truth": "github_issue",
+                "canonical_event_is_delivery_proof": False,
+            },
+        }
+
+    async def _handle_kopa_decision_command(self, msg: Any) -> None:
+        if not self._bot:
+            return
+        try:
+            for src in ("/home/az/projects/kopa-bot-telegram/src",):
+                if src not in sys.path:
+                    sys.path.insert(0, src)
+            from kopa_bot_telegram.decision_command import (
+                handle_decision_command_text,
+                parse_decision_command_text,
+            )
+
+            command = parse_decision_command_text(msg.text or "")
+            result = handle_decision_command_text(
+                text=msg.text or "",
+                event=self._build_kopa_decision_event(command.decision_id),
+                state_dir=self._kopa_decision_state_dir(),
+                authorized_actor="Founder",
+                evidence_url=f"local-evidence:kopa_decision_command#message_id-{getattr(msg, 'message_id', '')}",
+                send_receipt=None,
+            )
+            receipt = "\n".join([
+                "✅ 已记录：" + result.get("action", command.action),
+                "📌 decision=" + result.get("decision_id", command.decision_id),
+                "🧪 状态已写入本地决策记录；这不是 full Surface 验收。",
+            ])
+        except Exception as exc:
+            error_text = str(exc)
+            # Keep the user-facing error concise and avoid leaking internals.
+            receipt = "\n".join([
+                "⛔ 决策命令未记录",
+                f"⚠️ 原因：{error_text}",
+                "📌 格式：/kopa_decision AZ80066/kopa-os#423 ack reason=...",
+            ])
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(msg.chat_id),
+            "text": receipt,
+            **self._link_preview_kwargs(),
+        }
+        thread_id = getattr(msg, "message_thread_id", None)
+        if thread_id is not None:
+            kwargs.update(self._thread_kwargs_for_send(
+                str(msg.chat_id), str(thread_id), {"thread_id": str(thread_id)}, reply_to_mode=self._reply_to_mode
+            ))
+        await self._send_message_with_thread_fallback(**kwargs)
+
+    async def _send_kopa_command_deck(self, msg: Message) -> None:
+        """Send a compact Founder-facing KopaOS deck with live callback buttons."""
+        if not self._bot:
+            return
+        chat_id = int(msg.chat_id)
+        thread_id = getattr(msg, "message_thread_id", None)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ 播放队列", callback_data="kopa:playback_queue")],
+            [InlineKeyboardButton("💳 额度", callback_data="kopa:quota")],
+        ])
+        text = "\n".join([
+            "✅ KopaOS Command Deck",
+            "📌 请选择要查看的只读状态卡：",
+            "▶️ 播放队列｜💳 额度",
+        ])
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": keyboard,
+            **self._link_preview_kwargs(),
+        }
+        if thread_id is not None:
+            kwargs.update(self._thread_kwargs_for_send(
+                str(chat_id), str(thread_id), {"thread_id": str(thread_id)}, reply_to_mode=self._reply_to_mode
+            ))
+        try:
+            sent = await self._send_message_with_thread_fallback(**kwargs)
+            logger.info(
+                "Telegram Kopa founder deck sent: chat_id=%s thread_id=%s message_id=%s buttons=2",
+                chat_id, thread_id, getattr(sent, "message_id", None),
+            )
+        except Exception as exc:
+            logger.error("Telegram Kopa founder deck send failed: %s", exc, exc_info=True)
+
+    async def _handle_kopa_command_deck_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ 你无权操作这张卡。")
+            return
+
+        action = data.split(":", 1)[1]
+        try:
+            if action in {"playback_queue", "playlist"}:
+                heading = "▶️ 播放队列"
+                text = await self._render_kopa_playback_queue_card()
+            elif action == "quota":
+                heading = "💳 额度"
+                text = self._render_kopa_quota_card()
+            else:
+                await query.answer(text=f"未知操作：{action}")
+                return
+
+            await query.answer(text=heading)
+            try:
+                await query.edit_message_text(text=text, reply_markup=query.message.reply_markup if query.message else None)
+            except Exception:
+                if query.message:
+                    await self._send_message_with_thread_fallback(
+                        chat_id=int(query.message.chat_id),
+                        text=text,
+                        **self._thread_kwargs_for_send(
+                            str(query.message.chat_id),
+                            str(getattr(query.message, "message_thread_id", "") or "") or None,
+                            {"thread_id": str(getattr(query.message, "message_thread_id", "") or "")},
+                            reply_to_mode=self._reply_to_mode,
+                        ),
+                    )
+            self._record_kopa_callback_evidence(query, data, action, heading)
+            logger.info(
+                "Telegram Kopa action callback: data=%s action=%s status=rendered chat_id=%s thread_id=%s message_id=%s evidence=%s",
+                data,
+                action,
+                getattr(query.message, "chat_id", None) if query.message else None,
+                getattr(query.message, "message_thread_id", None) if query.message else None,
+                getattr(query.message, "message_id", None) if query.message else None,
+                self._kopa_callback_evidence_path(),
+            )
+        except Exception as exc:
+            logger.error("Telegram Kopa callback failed: %s", exc, exc_info=True)
+            await query.answer(text="⛔ 播放队列暂不可用")
+
+    async def _handle_kopa_decision_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Answer KopaOS decision-inbox callbacks so live CTA taps are visible.
+
+        The canonical decision workflow may live outside Hermes. The gateway's
+        responsibility here is deliberately bounded: authorize the click, answer
+        Telegram's callback query, and write a safe local evidence row. It must
+        not claim GitHub/Kanban/Surface source-of-truth acceptance by itself.
+        """
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ 你无权操作这张决策卡。", show_alert=True)
+            return
+
+        parts = data.split(":")
+        action = parts[2] if len(parts) >= 4 else "unknown"
+        allowed_actions = {"ack", "accept", "reject", "defer", "close"}
+        if action not in allowed_actions:
+            await query.answer(text="⚠️ 未支持的决策动作。", show_alert=True)
+            self._record_kopa_decision_callback_evidence(query, data, action, "unsupported")
+            return
+
+        status_map = {
+            "ack": "👀 已收到：ack",
+            "accept": "✅ 已记录：accept",
+            "reject": "❌ 已记录：reject",
+            "defer": "⏸ 已记录：defer",
+            "close": "🔒 已记录：close",
+        }
+        receipt = status_map[action]
+        await query.answer(text=receipt)
+        self._record_kopa_decision_callback_evidence(query, data, action, "telegram_callback_answered")
+
+        message = getattr(query, "message", None)
+        if message is not None:
+            try:
+                await self._send_message_with_thread_fallback(
+                    chat_id=int(message.chat_id),
+                    text="\n".join([
+                        receipt,
+                        "📌 已写入本地点击证据；这不是 GitHub/Surface 最终验收。",
+                    ]),
+                    **self._thread_kwargs_for_send(
+                        str(message.chat_id),
+                        str(getattr(message, "message_thread_id", "") or "") or None,
+                        {"thread_id": str(getattr(message, "message_thread_id", "") or "")},
+                        reply_to_mode=self._reply_to_mode,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Telegram Kopa decision callback receipt send failed: %s", exc)
+
+    def _kopa_decision_callback_evidence_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "events" / "telegram_kopa_decision_callbacks.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _record_kopa_decision_callback_evidence(self, query, callback_data: str, action: str, status: str) -> None:
+        try:
+            message = getattr(query, "message", None)
+            chat = getattr(message, "chat", None)
+            record = {
+                "schema_version": "telegram_kopa_decision_callback_v1",
+                "received_at": datetime.now(tz=timezone.utc).isoformat(),
+                "platform": "telegram",
+                "adapter": "Telegram",
+                "callback_query_id": str(getattr(query, "id", "")),
+                "callback_data_prefix": ":".join(str(callback_data).split(":")[:3]),
+                "action": action,
+                "action_result": {
+                    "status": status,
+                    "side_effects": ["telegram_callback_answer", "jsonl_evidence", "same_topic_receipt_attempt"],
+                    "source_of_truth_updated": False,
+                },
+                "from_user_id": str(getattr(getattr(query, "from_user", None), "id", "")),
+                "from_user_name": getattr(getattr(query, "from_user", None), "first_name", None),
+                "chat_id": str(getattr(message, "chat_id", "")) if message else None,
+                "chat_type": str(getattr(chat, "type", "")) if chat else None,
+                "thread_id": str(getattr(message, "message_thread_id", "")) if getattr(message, "message_thread_id", None) is not None else None,
+                "message_id": str(getattr(message, "message_id", "")) if message else None,
+            }
+            with self._kopa_decision_callback_evidence_path().open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("Telegram Kopa decision callback evidence write failed: %s", exc)
+
+    async def _render_kopa_playback_queue_card(self) -> str:
+        """Collect GitHub facts read-only, project via kopa-hermes, render via kopa-bot-telegram."""
+        import sys as _sys
+        for src in (
+            "/home/az/projects/kopa-hermes/src",
+            "/home/az/projects/kopa-bot-telegram/src",
+        ):
+            if src not in _sys.path:
+                _sys.path.insert(0, src)
+        from kopa_hermes.playback_queue import build_playback_queue, fail_closed_queue, github_issue_fact
+        from kopa_bot_telegram.playback_queue_renderer import render_playback_queue_card
+
+        cmd = (
+            "gh issue list --repo AZ80066/kopa-os --state open --limit 12 "
+            "--json number,title,state,url,labels,updatedAt,body"
+        )
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd="/home/az/projects/kopa-os",
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+            if proc.returncode != 0:
+                reason = (stderr.decode("utf-8", errors="replace").strip() or f"gh_exit_{proc.returncode}")[:120]
+                return render_playback_queue_card(fail_closed_queue(f"github_issue_source_unavailable: {reason}").to_dict())
+            issues = json.loads(stdout.decode("utf-8"))
+            facts = [github_issue_fact(issue) for issue in issues]
+            model = build_playback_queue(facts).to_dict()
+            return render_playback_queue_card(model)
+        except Exception as exc:
+            return render_playback_queue_card(fail_closed_queue(f"collector_exception: {exc}").to_dict())
+
+    def _render_kopa_quota_card(self) -> str:
+        return "\n".join([
+            "💳 额度",
+            "📌 额度卡当前保持只读摘要。",
+            "⚠️ 若要接入实时 provider 用量，需要单独接入 usage read-model；这里不展示写死额度。",
+        ])
+
+    def _kopa_callback_evidence_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "events" / "telegram_kopa_callbacks.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _record_kopa_callback_evidence(self, query, callback_data: str, action: str, heading: str) -> None:
+        try:
+            message = getattr(query, "message", None)
+            chat = getattr(message, "chat", None)
+            record = {
+                "schema_version": "telegram_kopa_callback_v1",
+                "received_at": datetime.now(tz=timezone.utc).isoformat(),
+                "platform": "telegram",
+                "adapter": "Telegram",
+                "callback_query_id": str(getattr(query, "id", "")),
+                "callback_data": callback_data,
+                "action": action,
+                "action_result": {
+                    "status": "rendered",
+                    "heading": heading,
+                    "side_effects": ["telegram_receipt", "jsonl_evidence", "read_only_projection"],
+                },
+                "from_user_id": str(getattr(getattr(query, "from_user", None), "id", "")),
+                "from_user_name": getattr(getattr(query, "from_user", None), "first_name", None),
+                "chat_id": str(getattr(message, "chat_id", "")) if message else None,
+                "chat_type": str(getattr(chat, "type", "")) if chat else None,
+                "thread_id": str(getattr(message, "message_thread_id", "")) if getattr(message, "message_thread_id", None) is not None else None,
+                "message_id": str(getattr(message, "message_id", "")) if message else None,
+            }
+            with self._kopa_callback_evidence_path().open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("Telegram Kopa callback evidence write failed: %s", exc)
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback
@@ -4768,6 +5178,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands
                 menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                menu_commands = [("kopa_decision", "KopaOS decision action")] + [
+                    (name, desc) for name, desc in menu_commands if name != "kopa_decision"
+                ]
+                menu_commands = menu_commands[:MAX_COMMANDS_PER_SCOPE]
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -4807,6 +5221,18 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if self._is_kopa_command_deck_summon(msg.text):
+            if not self._should_process_message(msg, is_command=True):
+                return
+            await self._ensure_forum_commands(msg)
+            await self._send_kopa_command_deck(msg)
+            return
+        if self._is_kopa_decision_command(msg.text):
+            if not self._should_process_message(msg, is_command=True):
+                return
+            await self._ensure_forum_commands(msg)
+            await self._handle_kopa_decision_command(msg)
             return
         if not self._should_process_message(msg, is_command=True):
             return
