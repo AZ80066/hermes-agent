@@ -1,8 +1,9 @@
 """Tests for KopaOS decision-inbox Telegram callbacks."""
 
+import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,6 +36,49 @@ def _ensure_telegram_mock():
 
 
 _ensure_telegram_mock()
+
+
+def _ensure_kopa_decision_command_mock():
+    """Keep this test independent from the local kopa-bot-telegram checkout."""
+    package = ModuleType("kopa_bot_telegram")
+    module = ModuleType("kopa_bot_telegram.decision_command")
+
+    def parse_decision_command_text(text: str):
+        parts = text.split()
+        decision_id = parts[1]
+        action = parts[2]
+        return SimpleNamespace(decision_id=decision_id, action=action)
+
+    def handle_decision_command_text(*, text, event, state_dir, authorized_actor, evidence_url, send_receipt):
+        command = parse_decision_command_text(text)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = state_dir / "decision-state.snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    command.decision_id: {
+                        "action": command.action,
+                        "entrypoint": "telegram_command_comment",
+                        "authorized_actor": authorized_actor,
+                        "evidence_url": evidence_url,
+                        "event_id": event["event_id"],
+                    }
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return {"decision_id": command.decision_id, "action": command.action}
+
+    setattr(module, "parse_decision_command_text", parse_decision_command_text)
+    setattr(module, "handle_decision_command_text", handle_decision_command_text)
+    setattr(package, "decision_command", module)
+    sys.modules.setdefault("kopa_bot_telegram", package)
+    sys.modules.setdefault("kopa_bot_telegram.decision_command", module)
+
+
+_ensure_kopa_decision_command_mock()
 
 from gateway.config import PlatformConfig
 from gateway.platforms.telegram import TelegramAdapter
