@@ -35,6 +35,7 @@ from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
 from utils import atomic_replace
+from tools.memory_governance import evaluate_prewrite, gate_block_response
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -284,16 +285,18 @@ class MemoryStore:
             entries = self._entries_for(target)
             limit = self._char_limit(target)
 
+            current = self._char_count(target)
+
             # Reject exact duplicates
             if content in entries:
-                return self._success_response(target, "Entry already exists (no duplicate added).")
+                gate = evaluate_prewrite("add", target, content, current, limit)
+                return self._success_response(target, "Entry already exists (no duplicate added).", gate)
 
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
 
             if new_total > limit:
-                current = self._char_count(target)
                 return {
                     "success": False,
                     "error": (
@@ -305,11 +308,15 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 }
 
+            gate = evaluate_prewrite("add", target, content, current, limit)
+            if gate.decision == "block":
+                return gate_block_response(gate, current, limit, entries)
+
             entries.append(content)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        return self._success_response(target, "Entry added.", gate)
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -422,7 +429,7 @@ class MemoryStore:
 
     # -- Internal helpers --
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+    def _success_response(self, target: str, message: Optional[str] = None, gate: Any = None) -> Dict[str, Any]:
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
@@ -437,6 +444,11 @@ class MemoryStore:
         }
         if message:
             resp["message"] = message
+        if gate is not None:
+            resp["prewrite_gate_record"] = gate.to_dict() if hasattr(gate, "to_dict") else gate
+            warnings = resp["prewrite_gate_record"].get("warnings") if isinstance(resp["prewrite_gate_record"], dict) else None
+            if warnings:
+                resp["warnings"] = warnings
         return resp
 
     def _render_block(self, target: str, entries: List[str]) -> str:
