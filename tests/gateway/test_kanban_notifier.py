@@ -1,9 +1,11 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -138,6 +140,77 @@ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypa
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_records_durable_delivery_evidence(tmp_path, monkeypatch):
+    """Successful sends record chat/message/thread evidence on the task.
+
+    The notifier cursor alone proves the event was processed, not where it
+    landed. A runtime smoke needs a durable, non-secret handle containing the
+    Telegram chat, returned message id, requested thread, and explicit fallback
+    state.
+    """
+    db_path = tmp_path / "delivery-evidence.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="evidence smoke", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="-1003874719298",
+            thread_id="12",
+        )
+        kb.complete_task(conn, tid, summary="done with evidence")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+
+    async def _send_with_handle(chat_id, text, metadata=None):
+        adapter.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(
+            success=True,
+            message_id="777",
+            raw_response={
+                "requested_thread_id": "12",
+                "delivered_thread_id": None,
+                "thread_fallback": True,
+            },
+        )
+
+    adapter.send = _send_with_handle
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, tid)
+    finally:
+        conn.close()
+
+    evidence_comments = [
+        c for c in comments if c.author == "kanban-notifier" and "delivery_evidence" in c.body
+    ]
+    assert len(evidence_comments) == 1
+    prefix, payload = evidence_comments[0].body.split("\n", 1)
+    assert prefix == "kanban-notifier delivery_evidence"
+    evidence = json.loads(payload)
+    assert evidence == {
+        "schema_version": "kanban_notifier_delivery_evidence_v1",
+        "task_id": tid,
+        "event_id": 2,
+        "event_kind": "completed",
+        "platform": "telegram",
+        "chat_id": "-1003874719298",
+        "requested_thread_id": "12",
+        "delivered_thread_id": None,
+        "thread_fallback": True,
+        "message_id": "777",
+        "board": "default",
+    }
 
 
 def test_kanban_db_path_is_test_isolated_from_real_home():

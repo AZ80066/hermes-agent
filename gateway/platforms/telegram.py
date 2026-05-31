@@ -1563,6 +1563,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload size limit (~4KB total).  Limit to 30 core commands
                 # to stay well under the threshold while covering all categories.
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                kopa_commands = [
+                    ("kopa_status", "Kopa current status and boundary"),
+                    ("kopa_version", "Kopa version and release boundary"),
+                    ("kopa_queue", "Kopa current M queue and blockers"),
+                ]
+                menu_commands = kopa_commands + [
+                    (name, desc) for name, desc in menu_commands if name not in {"kopa_status", "kopa_version", "kopa_queue"}
+                ]
+                menu_commands = menu_commands[:MAX_COMMANDS_PER_SCOPE]
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -1701,6 +1710,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
+            delivered_thread_id = None
             used_thread_fallback = False
             
             try:
@@ -1866,6 +1876,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+                if delivered_thread_id is None:
+                    delivered_thread_id = getattr(msg, "message_thread_id", effective_thread_id)
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -1883,6 +1895,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 raw_response={
                     "message_ids": message_ids,
                     "requested_thread_id": requested_thread_id,
+                    "delivered_thread_id": delivered_thread_id,
                     "thread_fallback": used_thread_fallback,
                 },
             )
@@ -3477,6 +3490,106 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_kopa_command_deck_summon(self, text: str) -> bool:
         token = (text or "").strip().split()[0].split("@", 1)[0].lower()
         return token in {"/kopa", "/deck", "/菜单"}
+
+    def _is_kopa_readonly_command(self, text: str) -> bool:
+        token = (text or "").strip().split()[0].split("@", 1)[0].lower()
+        return token in {"/kopa_status", "/kopa_version", "/kopa_queue"}
+
+    def _render_kopa_readonly_command(self, text: str) -> str:
+        """Render AZ80066/Kopa read-only command text via the repo-local M69 harness."""
+        repo_root = _Path("/home/az/projects/Kopa")
+        module_dir = repo_root / "runtime" / "hermes" / "local_surface"
+        module_path = str(module_dir)
+        if module_path not in sys.path:
+            sys.path.insert(0, module_path)
+        from kopa_readonly_commands_m69 import dispatch_command  # type: ignore
+
+        bot_username = getattr(getattr(self, "_bot_info", None), "username", None)
+        card = dispatch_command(text or "", repo_root=repo_root, bot_username=bot_username)
+        return card.text
+
+    def _record_kopa_readonly_command_evidence(
+        self,
+        *,
+        command_text: str,
+        inbound_message: Any,
+        outbound_message: Any,
+        source: str = "telegram_command_handler",
+    ) -> None:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "events" / "telegram_kopa_readonly_commands.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        thread_id = getattr(inbound_message, "message_thread_id", None)
+        event = {
+            "schema_version": "telegram_kopa_readonly_command_v1",
+            "observed_at": datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "source": source,
+            "command": (command_text or "").strip().split()[0].split("@", 1)[0].lower(),
+            "chat_id": int(inbound_message.chat_id),
+            "thread_id": thread_id,
+            "inbound_message_id": getattr(inbound_message, "message_id", None),
+            "outbound_message_id": getattr(outbound_message, "message_id", None),
+            "handler": "TelegramPlatform._send_kopa_readonly_command_card",
+            "renderer": "AZ80066/Kopa runtime/hermes/local_surface/kopa_readonly_commands_m69.py",
+            "runtime_effective": True,
+            "telegram_visible": getattr(outbound_message, "message_id", None) is not None,
+            "non_claims": [
+                "read_only_only",
+                "no_callback_execution",
+                "no_bot_to_bot_orchestration",
+                "no_mutating_action",
+                "not_deployed_public_distribution",
+                "not_founder_accepted_live_outcome",
+            ],
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    async def _send_kopa_readonly_command_card(
+        self,
+        msg: Any,
+        *,
+        source: str = "telegram_command_handler",
+    ) -> Any:
+        """Send a live read-only /kopa_status|version|queue card."""
+        if not self._bot:
+            return None
+        chat_id = int(msg.chat_id)
+        thread_id = getattr(msg, "message_thread_id", None)
+        try:
+            text = self._render_kopa_readonly_command(msg.text or "")
+        except Exception as exc:
+            logger.error("Telegram Kopa read-only command render failed: %s", exc, exc_info=True)
+            text = "\n".join([
+                "⛔ 已阻塞：Kopa 只读命令渲染失败",
+                "⚠️ 边界：未输出状态卡；不声明 live command 成功。",
+                "➡️ 下一步：检查 runtime renderer 与证据源。",
+            ])
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            **self._link_preview_kwargs(),
+        }
+        if thread_id is not None:
+            kwargs.update(self._thread_kwargs_for_send(
+                str(chat_id), str(thread_id), {"thread_id": str(thread_id)}, reply_to_mode=self._reply_to_mode
+            ))
+        sent = await self._send_message_with_thread_fallback(**kwargs)
+        self._record_kopa_readonly_command_evidence(
+            command_text=msg.text or "",
+            inbound_message=msg,
+            outbound_message=sent,
+            source=source,
+        )
+        logger.info(
+            "Telegram Kopa read-only command sent: chat_id=%s thread_id=%s inbound_message_id=%s outbound_message_id=%s",
+            chat_id,
+            thread_id,
+            getattr(msg, "message_id", None),
+            getattr(sent, "message_id", None),
+        )
+        return sent
 
     def _is_kopa_decision_command(self, text: str) -> bool:
         token = (text or "").strip().split()[0].split("@", 1)[0].lower()
@@ -5178,8 +5291,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands
                 menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                menu_commands = [("kopa_decision", "KopaOS decision action")] + [
-                    (name, desc) for name, desc in menu_commands if name != "kopa_decision"
+                kopa_commands = [
+                    ("kopa_status", "Kopa current status and boundary"),
+                    ("kopa_version", "Kopa version and release boundary"),
+                    ("kopa_queue", "Kopa current M queue and blockers"),
+                    ("kopa_decision", "KopaOS decision action"),
+                ]
+                menu_commands = kopa_commands + [
+                    (name, desc) for name, desc in menu_commands if name not in {"kopa_status", "kopa_version", "kopa_queue", "kopa_decision"}
                 ]
                 menu_commands = menu_commands[:MAX_COMMANDS_PER_SCOPE]
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
@@ -5221,6 +5340,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        if self._is_kopa_readonly_command(msg.text):
+            if not self._should_process_message(msg, is_command=True):
+                return
+            await self._ensure_forum_commands(msg)
+            await self._send_kopa_readonly_command_card(msg)
             return
         if self._is_kopa_command_deck_summon(msg.text):
             if not self._should_process_message(msg, is_command=True):

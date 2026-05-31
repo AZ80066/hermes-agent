@@ -732,6 +732,38 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
     assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
 
 
+@pytest.mark.asyncio
+async def test_send_records_thread_delivery_metadata_after_topic_fallback(monkeypatch):
+    """SendResult should expose where a topic send actually landed."""
+    import telegram.error as telegram_error
+
+    BadRequest = type("BadRequest", (telegram_error.NetworkError,), {})
+    monkeypatch.setattr(telegram_error, "BadRequest", BadRequest)
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    bot = MagicMock()
+    calls = []
+
+    async def _fake_send_message(**kwargs):
+        calls.append(dict(kwargs))
+        if kwargs.get("message_thread_id") is not None:
+            raise BadRequest("Message thread not found")
+        return SimpleNamespace(message_id=777, message_thread_id=None)
+
+    bot.send_message = AsyncMock(side_effect=_fake_send_message)
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+
+    result = await adapter.send("-1003874719298", "hello", metadata={"thread_id": "12"})
+
+    assert result.success is True
+    assert result.message_id == "777"
+    assert (result.raw_response or {})["requested_thread_id"] == 12
+    assert (result.raw_response or {})["delivered_thread_id"] is None
+    assert (result.raw_response or {})["thread_fallback"] is True
+    assert [call.get("message_thread_id") for call in calls] == [12, 12, None]
+
+
 # =========================================================================
 # edit_message — streaming Markdown safety
 # =========================================================================

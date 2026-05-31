@@ -4492,24 +4492,8 @@ class GatewayRunner:
         except Exception:
             return "default"
 
-    def _format_kopa_workflow_feed_card(self, event_payload: Any, task: Any = None, kind: str = "") -> str | None:
-        """Render Kopa readable workflow cards for annotated Kanban events.
-
-        Generic Kanban tasks deliberately fall through to the legacy notifier
-        strings. Kopa adoption is opt-in via an event payload field so this
-        runtime patch is safe for existing boards and non-Kopa users.
-        """
-        if not isinstance(event_payload, dict):
-            return None
-        feed = (
-            event_payload.get("kopa_workflow_feed")
-            or event_payload.get("workflow_progress_feed")
-            or event_payload.get("workflow_progress_event")
-        )
-        if not isinstance(feed, dict):
-            return None
-
-        event_type = str(feed.get("event_type") or "").strip()
+    @staticmethod
+    def _kopa_feed_label(event_type: str, kind: str = "") -> str | None:
         if not event_type:
             event_type = {
                 "completed": "closeout_or_partial_closeout",
@@ -4523,16 +4507,79 @@ class GatewayRunner:
             "scope_locked": "📌 范围已锁定",
             "dispatch_planned": "🚦 已分派",
             "builder_started": "🔧 Builder 开始",
-            "progress_update": "🔎 有进展",
+            "progress_update": "🔎 进展更新",
             "handoff_to_review": "🤝 已交 Review",
             "review_started": "🧪 Review 开始",
             "review_result": "🧪 Review 结果",
-            "blocker_or_decision_needed": "⛔ 需要决策",
+            "blocker_or_decision_needed": "⛔ 需要处理",
             "closeout_or_partial_closeout": "✅ Gate Closeout",
             "retrospective": "📚 复盘",
             "learning_routed": "📌 学习已路由",
         }
-        label = labels.get(event_type)
+        return labels.get(event_type)
+
+    @staticmethod
+    def _kopa_card_has_forbidden_text(card: str) -> bool:
+        forbidden = (
+            "{", "}", "```json", "```yaml", "Traceback", "/home/", "C:\\\\",
+            "All done, live now", "version delivered", "V delivered",
+            "release-ready", "deployed-live", "整个 V 已交付", "版本已交付",
+            "已上线", "Founder accepted",
+        )
+        return any(fragment in card for fragment in forbidden)
+
+    @staticmethod
+    def _render_kopa_founder_feed_card(
+        *,
+        label: str,
+        conclusion: str,
+        evidence: str,
+        scope: str,
+        owner: str,
+        next_step: str,
+        boundary: str,
+    ) -> str | None:
+        """Single Founder-readable feed template for Kopa Telegram cards.
+
+        Keep this as the only shape used by Kopa Kanban/workflow-feed
+        notifications. It intentionally avoids markdown tables, raw JSON,
+        absolute paths, and English lifecycle jargon so later local patches do
+        not drift back into machine-readable-but-human-hostile output.
+        """
+        fields = (label, conclusion, evidence, scope, owner, next_step, boundary)
+        if not all(str(value or "").strip() for value in fields):
+            return None
+        card = "\n".join([
+            label,
+            f"✅ 结论：{conclusion.strip()}",
+            f"🔎 证据：{evidence.strip()}",
+            f"📍 范围：{scope.strip()}",
+            f"👤 负责人：{owner.strip()}",
+            f"➡️ 下一步：{next_step.strip()}",
+            f"⚠️ 边界：{boundary.strip()}",
+        ])
+        if GatewayRunner._kopa_card_has_forbidden_text(card):
+            return None
+        return card
+
+    def _format_kopa_workflow_feed_card(
+        self,
+        event_payload: Any,
+        task: Any = None,
+        kind: str = "",
+    ) -> str | None:
+        """Render annotated Kopa workflow payloads through the fixed card contract."""
+        if not isinstance(event_payload, dict):
+            return None
+        feed = (
+            event_payload.get("kopa_workflow_feed")
+            or event_payload.get("workflow_progress_feed")
+            or event_payload.get("workflow_progress_event")
+        )
+        if not isinstance(feed, dict):
+            return None
+
+        label = self._kopa_feed_label(str(feed.get("event_type") or "").strip(), kind)
         if not label:
             return None
 
@@ -4543,13 +4590,6 @@ class GatewayRunner:
         if any(not str(hierarchy.get(field) or "").strip() for field in required_hierarchy):
             return None
 
-        summary = str(feed.get("summary") or "").strip()
-        owner = str(feed.get("owner") or getattr(task, "assignee", "") or "").strip()
-        next_step = str(feed.get("next_step") or "").strip()
-        boundary = str(feed.get("boundary") or "").strip()
-        if not all((summary, owner, next_step, boundary)):
-            return None
-
         claim_boundary = feed.get("claim_boundary")
         if isinstance(claim_boundary, dict):
             for field in ("version_delivered", "deployed_live", "founder_accepted_live_outcome"):
@@ -4557,24 +4597,66 @@ class GatewayRunner:
                     return None
 
         scope = " → ".join(str(hierarchy[field]).strip() for field in required_hierarchy)
-        card = "\n".join([
-            f"{label}：{summary}",
-            "",
-            f"做什么：{summary}",
-            f"归属：{scope}",
-            f"Owner：{owner}",
-            f"下一步：{next_step}",
-            f"⚠️ 边界：{boundary}",
-        ])
-        forbidden = (
-            "{", "}", "```json", "```yaml", "Traceback", "/home/", "C:\\\\",
-            "All done, live now", "version delivered", "V delivered",
-            "release-ready", "deployed-live", "整个 V 已交付", "版本已交付",
-            "已上线", "Founder accepted",
+        evidence = str(feed.get("evidence") or feed.get("evidence_summary") or "Kanban 事件已记录").strip()
+        return self._render_kopa_founder_feed_card(
+            label=label,
+            conclusion=str(feed.get("summary") or "").strip(),
+            evidence=evidence,
+            scope=scope,
+            owner=str(feed.get("owner") or getattr(task, "assignee", "") or "").strip(),
+            next_step=str(feed.get("next_step") or "").strip(),
+            boundary=str(feed.get("boundary") or "").strip(),
         )
-        if any(fragment in card for fragment in forbidden):
+
+    def _format_kopa_kanban_terminal_card(
+        self,
+        *,
+        task: Any,
+        event: Any,
+        kind: str,
+        title: str,
+        board_slug: str,
+    ) -> str | None:
+        """Founder-readable fallback for Kopa board terminal events.
+
+        This catches ordinary Kanban completed/blocked/crash events that do not
+        yet carry an annotated workflow payload, preventing Kopa feeds from
+        falling back to terse raw strings like ``Kanban t_x done``.
+        """
+        if not board_slug.startswith("kopa") and "kopa" not in board_slug:
             return None
-        return card
+        label = self._kopa_feed_label("", kind)
+        if not label:
+            return None
+        owner = str(getattr(task, "assignee", "") or "未分配").strip()
+        task_id = str(getattr(task, "id", "") or getattr(event, "task_id", "") or "unknown").strip()
+        reason = ""
+        payload = getattr(event, "payload", None)
+        if isinstance(payload, dict):
+            reason = str(payload.get("reason") or payload.get("error") or payload.get("summary") or "").strip()
+        conclusion_by_kind = {
+            "completed": f"{title} 已完成",
+            "blocked": f"{title} 被阻塞" + (f"：{reason[:80]}" if reason else ""),
+            "gave_up": f"{title} 多次失败后已暂停",
+            "crashed": f"{title} worker 崩溃，等待调度恢复",
+            "timed_out": f"{title} 执行超时，等待调度恢复",
+        }
+        next_by_kind = {
+            "completed": "进入 Review/closeout/readback；不要把任务完成直接说成版本交付。",
+            "blocked": "由负责人处理 blocker，必要时升级给 Founder 决策。",
+            "gave_up": "安排 WK/Owner 复核失败原因后再重试。",
+            "crashed": "检查 worker 日志与运行环境后重试。",
+            "timed_out": "检查任务粒度/超时配置后重试。",
+        }
+        return self._render_kopa_founder_feed_card(
+            label=label,
+            conclusion=conclusion_by_kind.get(kind, f"{title} 状态更新"),
+            evidence=f"Kanban task {task_id} · event={kind}",
+            scope=f"{board_slug} → Kanban → {kind} → {task_id}",
+            owner=owner,
+            next_step=next_by_kind.get(kind, "继续按当前 workflow gate 推进。"),
+            boundary="这是任务级 workflow feed；不等同于完整版本交付、live 部署或 Founder 验收。",
+        )
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -4766,6 +4848,14 @@ class GatewayRunner:
                         msg = self._format_kopa_workflow_feed_card(
                             getattr(ev, "payload", None), task=task, kind=kind
                         )
+                        if msg is None and task is not None:
+                            msg = self._format_kopa_kanban_terminal_card(
+                                task=task,
+                                event=ev,
+                                kind=kind,
+                                title=title,
+                                board_slug=board_slug or "default",
+                            )
                         if msg is not None:
                             pass
                         # Identity prefix: attribute terminal pings to the
@@ -4853,6 +4943,21 @@ class GatewayRunner:
                                 delivered_thread_id,
                                 board_slug,
                             )
+                            try:
+                                await asyncio.to_thread(
+                                    self._record_kanban_delivery_evidence,
+                                    sub,
+                                    ev,
+                                    send_result,
+                                    board_slug,
+                                )
+                            except Exception as evidence_exc:
+                                logger.warning(
+                                    "kanban notifier: delivery evidence for %s on board %s failed: %s",
+                                    sub["task_id"],
+                                    board_slug,
+                                    evidence_exc,
+                                )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
@@ -4967,6 +5072,51 @@ class GatewayRunner:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
             )
+        finally:
+            conn.close()
+
+    def _record_kanban_delivery_evidence(
+        self,
+        sub: dict,
+        ev: Any,
+        send_result: Any,
+        board: Optional[str] = None,
+    ) -> None:
+        """Persist non-secret delivery evidence for a Kanban notification.
+
+        Advancing the notifier cursor only proves the event was processed by a
+        gateway tick. Runtime smokes also need a durable handle showing where a
+        successful send landed, including Telegram thread fallback state when a
+        configured topic was unavailable.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        raw_response = getattr(send_result, "raw_response", None)
+        raw = raw_response if isinstance(raw_response, dict) else {}
+        requested_thread_id = raw.get("requested_thread_id")
+        if requested_thread_id is None:
+            requested_thread_id = sub.get("thread_id") or None
+        evidence = {
+            "schema_version": "kanban_notifier_delivery_evidence_v1",
+            "task_id": sub["task_id"],
+            "event_id": getattr(ev, "id", None),
+            "event_kind": getattr(ev, "kind", None),
+            "platform": sub.get("platform"),
+            "chat_id": sub.get("chat_id"),
+            "requested_thread_id": requested_thread_id,
+            "delivered_thread_id": raw.get("delivered_thread_id"),
+            "thread_fallback": bool(raw.get("thread_fallback")),
+            "message_id": getattr(send_result, "message_id", None),
+            "board": board or _kb.DEFAULT_BOARD,
+        }
+        body = "kanban-notifier delivery_evidence\n" + json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        conn = _kb.connect(board=board)
+        try:
+            _kb.add_comment(conn, sub["task_id"], "kanban-notifier", body)
         finally:
             conn.close()
 
