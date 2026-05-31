@@ -4506,13 +4506,13 @@ class GatewayRunner:
             "intake_received": "📥 已收到",
             "scope_locked": "📌 范围已锁定",
             "dispatch_planned": "🚦 已分派",
-            "builder_started": "🔧 Builder 开始",
+            "builder_started": "🔧 开始执行",
             "progress_update": "🔎 进展更新",
-            "handoff_to_review": "🤝 已交 Review",
-            "review_started": "🧪 Review 开始",
-            "review_result": "🧪 Review 结果",
+            "handoff_to_review": "🤝 已交审",
+            "review_started": "🧪 开始审查",
+            "review_result": "🧪 审查结果",
             "blocker_or_decision_needed": "⛔ 需要处理",
-            "closeout_or_partial_closeout": "✅ Gate Closeout",
+            "closeout_or_partial_closeout": "✅ 已收口",
             "retrospective": "📚 复盘",
             "learning_routed": "📌 学习已路由",
         }
@@ -4529,6 +4529,14 @@ class GatewayRunner:
         return any(fragment in card for fragment in forbidden)
 
     @staticmethod
+    def _compact_kopa_card_text(value: str, limit: int = 72) -> str:
+        """Keep Telegram feed lines short enough to read at a glance."""
+        text = " ".join(str(value or "").strip().split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "…"
+
+    @staticmethod
     def _render_kopa_founder_feed_card(
         *,
         label: str,
@@ -4539,24 +4547,18 @@ class GatewayRunner:
         next_step: str,
         boundary: str,
     ) -> str | None:
-        """Single Founder-readable feed template for Kopa Telegram cards.
-
-        Keep this as the only shape used by Kopa Kanban/workflow-feed
-        notifications. It intentionally avoids markdown tables, raw JSON,
-        absolute paths, and English lifecycle jargon so later local patches do
-        not drift back into machine-readable-but-human-hostile output.
-        """
+        """Single concise, emoji-leading Founder-readable feed template."""
         fields = (label, conclusion, evidence, scope, owner, next_step, boundary)
         if not all(str(value or "").strip() for value in fields):
             return None
         card = "\n".join([
-            label,
-            f"✅ 结论：{conclusion.strip()}",
-            f"🔎 证据：{evidence.strip()}",
-            f"📍 范围：{scope.strip()}",
-            f"👤 负责人：{owner.strip()}",
-            f"➡️ 下一步：{next_step.strip()}",
-            f"⚠️ 边界：{boundary.strip()}",
+            GatewayRunner._compact_kopa_card_text(label, 36),
+            f"✅ {GatewayRunner._compact_kopa_card_text(conclusion)}",
+            f"🔎 {GatewayRunner._compact_kopa_card_text(evidence)}",
+            f"📍 {GatewayRunner._compact_kopa_card_text(scope)}",
+            f"👤 {GatewayRunner._compact_kopa_card_text(owner, 48)}",
+            f"➡️ {GatewayRunner._compact_kopa_card_text(next_step)}",
+            f"⚠️ {GatewayRunner._compact_kopa_card_text(boundary)}",
         ])
         if GatewayRunner._kopa_card_has_forbidden_text(card):
             return None
@@ -4596,13 +4598,15 @@ class GatewayRunner:
                 if claim_boundary.get(field) is True:
                     return None
 
-        scope = " → ".join(str(hierarchy[field]).strip() for field in required_hierarchy)
-        evidence = str(feed.get("evidence") or feed.get("evidence_summary") or "Kanban 事件已记录").strip()
+        compact_scope = " / ".join(
+            str(hierarchy[field]).strip() for field in ("version", "package", "task")
+        )
+        evidence = str(feed.get("evidence") or feed.get("evidence_summary") or "Kanban 已记录").strip()
         return self._render_kopa_founder_feed_card(
             label=label,
             conclusion=str(feed.get("summary") or "").strip(),
             evidence=evidence,
-            scope=scope,
+            scope=compact_scope,
             owner=str(feed.get("owner") or getattr(task, "assignee", "") or "").strip(),
             next_step=str(feed.get("next_step") or "").strip(),
             boundary=str(feed.get("boundary") or "").strip(),
@@ -4635,27 +4639,27 @@ class GatewayRunner:
         if isinstance(payload, dict):
             reason = str(payload.get("reason") or payload.get("error") or payload.get("summary") or "").strip()
         conclusion_by_kind = {
-            "completed": f"{title} 已完成",
-            "blocked": f"{title} 被阻塞" + (f"：{reason[:80]}" if reason else ""),
-            "gave_up": f"{title} 多次失败后已暂停",
-            "crashed": f"{title} worker 崩溃，等待调度恢复",
-            "timed_out": f"{title} 执行超时，等待调度恢复",
+            "completed": f"{title} 完成了",
+            "blocked": f"{title} 卡住了" + (f"：{reason[:48]}" if reason else ""),
+            "gave_up": f"{title} 已暂停，需复核",
+            "crashed": f"{title} worker 崩了，待恢复",
+            "timed_out": f"{title} 超时了，待处理",
         }
         next_by_kind = {
-            "completed": "进入 Review/closeout/readback；不要把任务完成直接说成版本交付。",
-            "blocked": "由负责人处理 blocker，必要时升级给 Founder 决策。",
-            "gave_up": "安排 WK/Owner 复核失败原因后再重试。",
-            "crashed": "检查 worker 日志与运行环境后重试。",
-            "timed_out": "检查任务粒度/超时配置后重试。",
+            "completed": "下一步审查收口；别把单任务说成整版交付。",
+            "blocked": "负责人先处理 blocker；需要你拍板再升级。",
+            "gave_up": "WK/Owner 看失败原因，再决定是否重试。",
+            "crashed": "先看 worker 日志，再重试。",
+            "timed_out": "先缩小任务或调整超时，再重试。",
         }
         return self._render_kopa_founder_feed_card(
             label=label,
-            conclusion=conclusion_by_kind.get(kind, f"{title} 状态更新"),
-            evidence=f"Kanban task {task_id} · event={kind}",
-            scope=f"{board_slug} → Kanban → {kind} → {task_id}",
+            conclusion=conclusion_by_kind.get(kind, f"{title} 有更新"),
+            evidence=f"Kanban 已记录：{task_id} / {kind}",
+            scope=f"{board_slug} / {task_id}",
             owner=owner,
-            next_step=next_by_kind.get(kind, "继续按当前 workflow gate 推进。"),
-            boundary="这是任务级 workflow feed；不等同于完整版本交付、live 部署或 Founder 验收。",
+            next_step=next_by_kind.get(kind, "继续按当前 gate 推进。"),
+            boundary="只是任务进展，不是整版交付、上线或验收。",
         )
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:

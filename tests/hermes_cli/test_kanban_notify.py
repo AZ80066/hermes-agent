@@ -138,12 +138,15 @@ async def test_kopa_workflow_feed_payload_renders_readable_card(kanban_home):
 
     fake_adapter.send.assert_called_once()
     call_msg = fake_adapter.send.call_args[0][1]
-    assert call_msg.startswith("✅ Gate Closeout\n")
-    assert "✅ 结论：runtime Kanban notifier 已渲染易读 workflow card" in call_msg
-    assert "🔎 证据：Kanban 事件已记录" in call_msg
-    assert "📍 范围：v0.3.7-alpha → Founder-visible Workflow Progress Feed → V37-P8 → runtime-adoption-smoke" in call_msg
-    assert "👤 负责人：kopawk / Workflow Keeper" in call_msg
-    assert "➡️ 下一步：记录 message_id 并关闭 runtime adoption smoke gate" in call_msg
+    assert call_msg.startswith("✅ 已收口\n")
+    assert "✅ runtime Kanban notifier 已渲染易读 workflow card" in call_msg
+    assert "🔎 Kanban 已记录" in call_msg
+    assert "📍 v0.3.7-alpha / V37-P8 / runtime-adoption-smoke" in call_msg
+    assert "👤 kopawk / Workflow Keeper" in call_msg
+    assert "➡️ 记录 message_id 并关闭 runtime adoption smoke gate" in call_msg
+    assert all(line[:1] in "✅🔎📍👤➡⚠🧪⛔📌📥🚦🔧🤝📚" for line in call_msg.splitlines())
+    assert all(len(line) <= 80 for line in call_msg.splitlines())
+    assert "结论：" not in call_msg
     assert "Kanban t_" not in call_msg
     assert "deployed-live" not in call_msg
 
@@ -165,13 +168,15 @@ def test_kopa_board_generic_terminal_event_uses_fixed_founder_feed_template():
     )
 
     assert card is not None
-    assert card.startswith("✅ Gate Closeout\n")
-    assert "✅ 结论：Fix readable feed drift 已完成" in card
-    assert "🔎 证据：Kanban task t_demo1234 · event=completed" in card
-    assert "📍 范围：kopa-os → Kanban → completed → t_demo1234" in card
-    assert "👤 负责人：kopawk" in card
-    assert "➡️ 下一步：进入 Review/closeout/readback" in card
-    assert "⚠️ 边界：这是任务级 workflow feed" in card
+    assert card.startswith("✅ 已收口\n")
+    assert "✅ Fix readable feed drift 完成了" in card
+    assert "🔎 Kanban 已记录：t_demo1234 / completed" in card
+    assert "📍 kopa-os / t_demo1234" in card
+    assert "👤 kopawk" in card
+    assert "➡️ 下一步审查收口；别把单任务说成整版交付。" in card
+    assert "⚠️ 只是任务进展，不是整版交付、上线或验收。" in card
+    assert all(line[:1] in "✅🔎📍👤➡⚠🧪⛔📌📥🚦🔧🤝📚" for line in card.splitlines())
+    assert all(len(line) <= 80 for line in card.splitlines())
     assert "Kanban t_demo1234 done" not in card
     assert "已上线" not in card
 
