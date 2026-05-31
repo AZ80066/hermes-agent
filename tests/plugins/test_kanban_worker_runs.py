@@ -145,6 +145,61 @@ def test_workers_active_excludes_runs_without_pid(client):
     assert r.json()["count"] == 0
 
 
+def test_dashboard_create_auto_subscribes_owned_kopa_tasks_to_workflow_feed(client, monkeypatch):
+    """Dashboard-created Kopa workflow tasks must enter the passive feed too."""
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_INCLUDE_SMOKE", raising=False)
+    kb.create_board("kopa-os")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks?board=kopa-os",
+        json={
+            "title": "V37 feed runtime adoption：dashboard 真实任务",
+            "body": "验证 dashboard create 自动订阅；不是 smoke/proof。",
+            "assignee": "kopawk",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    task_id = body["task"]["id"]
+    assert body.get("kopa_workflow_feed_subscribed") is True
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+
+
+def test_dashboard_create_keeps_smoke_tasks_unsubscribed_on_kopa_board(client, monkeypatch):
+    """Dashboard-created smoke/proof tasks should not enter the passive feed."""
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_INCLUDE_SMOKE", raising=False)
+    kb.create_board("kopa-os")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks?board=kopa-os",
+        json={
+            "title": "V37 feed dashboard smoke：message_id proof",
+            "body": "单条 route proof，不代表交付。",
+            "assignee": "kopawk",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    task_id = body["task"]["id"]
+    assert "kopa_workflow_feed_subscribed" not in body
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert subs == []
+
+
 # ---------------------------------------------------------------------------
 # GET /runs/{run_id}
 # ---------------------------------------------------------------------------

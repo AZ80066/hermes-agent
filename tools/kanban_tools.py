@@ -34,6 +34,7 @@ import os
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
+from hermes_cli.kanban_workflow_feed import maybe_auto_subscribe_kopa_workflow_feed
 
 logger = logging.getLogger(__name__)
 
@@ -707,9 +708,13 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            kopa_feed_subscribed = maybe_auto_subscribe_kopa_workflow_feed(
+                conn, new_tid, board=board
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                kopa_workflow_feed_subscribed=kopa_feed_subscribed,
             )
         finally:
             conn.close()

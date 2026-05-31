@@ -79,6 +79,52 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+def test_dashboard_create_auto_subscribes_owned_kopa_tasks(client):
+    kb.create_board("kopa-os")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks?board=kopa-os",
+        json={
+            "title": "V37 feed runtime adoption：dashboard task",
+            "body": "真实 owned dashboard task",
+            "assignee": "kopawk",
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["kopa_workflow_feed_subscribed"] is True
+    task_id = data["task"]["id"]
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        assert len(kb.list_notify_subs(conn, task_id)) == 1
+    finally:
+        conn.close()
+
+
+def test_dashboard_create_does_not_auto_subscribe_smoke_tasks(client):
+    kb.create_board("kopa-os")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks?board=kopa-os",
+        json={
+            "title": "V37 feed smoke：delivery_evidence proof",
+            "body": "message_id proof only",
+            "assignee": "kopawk",
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data.get("kopa_workflow_feed_subscribed") is not True
+    task_id = data["task"]["id"]
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------

@@ -171,6 +171,56 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def test_create_auto_subscribes_owned_kopa_tasks_on_explicit_board(monkeypatch, worker_env):
+    """Agent kanban_create path must share Kopa feed adoption with CLI create."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_INCLUDE_SMOKE", raising=False)
+    kb.create_board("kopa-os")
+
+    out = kt._handle_create({
+        "title": "V37 feed runtime adoption：真实任务生命周期卡",
+        "body": "真实 owned task",
+        "assignee": "kopawk",
+        "board": "kopa-os",
+    })
+    data = json.loads(out)
+    assert "error" not in data
+    assert data["kopa_workflow_feed_subscribed"] is True
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        assert len(kb.list_notify_subs(conn, data["task_id"])) == 1
+    finally:
+        conn.close()
+
+
+def test_create_does_not_auto_subscribe_smoke_tasks(monkeypatch, worker_env):
+    """Agent-created smoke/proof tasks stay out of the Founder feed."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_INCLUDE_SMOKE", raising=False)
+    kb.create_board("kopa-os")
+
+    out = kt._handle_create({
+        "title": "V37 feed smoke：delivery_evidence proof",
+        "body": "route proof only",
+        "assignee": "kopawk",
+        "board": "kopa-os",
+    })
+    data = json.loads(out)
+    assert "error" not in data
+    assert data.get("kopa_workflow_feed_subscribed") is not True
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        assert kb.list_notify_subs(conn, data["task_id"]) == []
+    finally:
+        conn.close()
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
@@ -766,6 +816,60 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_auto_subscribes_owned_kopa_tasks_to_workflow_feed(worker_env, monkeypatch):
+    """Agent tool-created Kopa workflow tasks must get the same feed subscription as CLI creates."""
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_INCLUDE_SMOKE", raising=False)
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_ALLOW_UNASSIGNED", raising=False)
+    from hermes_cli import kanban_db as kb
+    kb.create_board("kopa-os")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "V37 feed runtime adoption：工具路径真实任务",
+        "body": "验证真实任务自动进入 workflow feed；不是 smoke/proof 任务。",
+        "assignee": "kopawk",
+        "board": "kopa-os",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "-1003874719298"
+    assert subs[0]["thread_id"] == ""
+
+
+def test_create_keeps_explicit_smoke_tasks_unsubscribed_on_kopa_board(worker_env, monkeypatch):
+    """Agent tool-created smoke/proof tasks should remain silent by default."""
+    monkeypatch.delenv("KOPA_WORKFLOW_FEED_INCLUDE_SMOKE", raising=False)
+    from hermes_cli import kanban_db as kb
+    kb.create_board("kopa-os")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "V37 feed runtime smoke：message_id proof",
+        "body": "单条 route proof，不代表交付。",
+        "assignee": "kopawk",
+        "board": "kopa-os",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect(board="kopa-os")
+    try:
+        subs = kb.list_notify_subs(conn, d["task_id"])
+    finally:
+        conn.close()
+
+    assert subs == []
 
 
 def test_create_stamps_session_id_from_env(monkeypatch, worker_env):

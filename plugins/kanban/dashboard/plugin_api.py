@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_workflow_feed import maybe_auto_subscribe_kopa_workflow_feed
 
 log = logging.getLogger(__name__)
 
@@ -587,7 +588,12 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
         )
         task = kanban_db.get_task(conn, task_id)
+        kopa_feed_subscribed = maybe_auto_subscribe_kopa_workflow_feed(
+            conn, task_id, board=board
+        )
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        if kopa_feed_subscribed:
+            body["kopa_workflow_feed_subscribed"] = True
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit

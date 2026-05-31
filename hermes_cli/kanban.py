@@ -25,12 +25,16 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_workflow_feed import (
+    maybe_auto_subscribe_kopa_workflow_feed as _maybe_auto_subscribe_kopa_workflow_feed,
+)
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
 
 # ---------------------------------------------------------------------------
 # Small formatting helpers
 # ---------------------------------------------------------------------------
+
 
 _STATUS_ICONS = {
     "todo":     "◻",
@@ -1328,10 +1332,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        kopa_feed_subscribed = _maybe_auto_subscribe_kopa_workflow_feed(conn, task_id)
     if getattr(args, "json", False):
-        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+        out = _task_to_dict(task)
+        if kopa_feed_subscribed:
+            out["kopa_workflow_feed_subscribed"] = True
+        print(json.dumps(out, indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if kopa_feed_subscribed:
+            print("Kopa workflow feed: subscribed to Telegram topic")
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are

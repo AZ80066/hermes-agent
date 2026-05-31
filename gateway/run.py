@@ -4496,6 +4496,12 @@ class GatewayRunner:
     def _kopa_feed_label(event_type: str, kind: str = "") -> str | None:
         if not event_type:
             event_type = {
+                "created": "intake_received",
+                "assigned": "dispatch_planned",
+                "claimed": "builder_started",
+                "commented": "progress_update",
+                "claim_extended": "progress_update",
+                "unblocked": "progress_update",
                 "completed": "closeout_or_partial_closeout",
                 "blocked": "blocker_or_decision_needed",
                 "gave_up": "blocker_or_decision_needed",
@@ -4639,6 +4645,12 @@ class GatewayRunner:
         if isinstance(payload, dict):
             reason = str(payload.get("reason") or payload.get("error") or payload.get("summary") or "").strip()
         conclusion_by_kind = {
+            "created": f"{title} 已进入队列",
+            "assigned": f"{title} 已分派给 {owner}",
+            "claimed": f"{title} 开始执行",
+            "commented": f"{title} 有进展" + (f"：{reason[:48]}" if reason else ""),
+            "claim_extended": f"{title} 仍在执行",
+            "unblocked": f"{title} 已恢复推进" + (f"：{reason[:48]}" if reason else ""),
             "completed": f"{title} 完成了",
             "blocked": f"{title} 卡住了" + (f"：{reason[:48]}" if reason else ""),
             "gave_up": f"{title} 已暂停，需复核",
@@ -4646,6 +4658,12 @@ class GatewayRunner:
             "timed_out": f"{title} 超时了，待处理",
         }
         next_by_kind = {
+            "created": "等待分派或 worker claim。",
+            "assigned": "等待对应角色开始执行。",
+            "claimed": "执行中；后续进展会继续进 feed。",
+            "commented": "继续看下一次进展、阻塞或完成卡。",
+            "claim_extended": "继续执行；若超时再升级处理。",
+            "unblocked": "继续执行；若再次卡住会发阻塞卡。",
             "completed": "下一步审查收口；别把单任务说成整版交付。",
             "blocked": "负责人先处理 blocker；需要你拍板再升级。",
             "gave_up": "WK/Owner 看失败原因，再决定是否重试。",
@@ -4688,7 +4706,19 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        FEED_KINDS = (
+            "created",
+            "assigned",
+            "claimed",
+            "commented",
+            "claim_extended",
+            "unblocked",
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -4796,7 +4826,7 @@ class GatewayRunner:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=FEED_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -4849,8 +4879,19 @@ class GatewayRunner:
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
+                        ev_payload = getattr(ev, "payload", None)
+                        if (
+                            kind == "commented"
+                            and isinstance(ev_payload, dict)
+                            and str(ev_payload.get("author") or "").strip() == "kanban-notifier"
+                        ):
+                            # Delivery-evidence comments are internal receipts written by
+                            # this notifier after a successful send. They must not be
+                            # re-projected as Founder-visible progress, or the notifier
+                            # feeds on its own receipts and creates an infinite noise loop.
+                            continue
                         msg = self._format_kopa_workflow_feed_card(
-                            getattr(ev, "payload", None), task=task, kind=kind
+                            ev_payload, task=task, kind=kind
                         )
                         if msg is None and task is not None:
                             msg = self._format_kopa_kanban_terminal_card(
@@ -5031,7 +5072,10 @@ class GatewayRunner:
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
-                        if task_terminal:
+                        terminal_event_delivered = any(
+                            ev.kind in {"completed", "archived"} for ev in d["events"]
+                        )
+                        if task_terminal and terminal_event_delivered:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
