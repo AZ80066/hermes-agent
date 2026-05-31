@@ -74,6 +74,79 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_kopa_workflow_feed_payload_renders_readable_card(kanban_home):
+    """Annotated Kopa events render as Chinese workflow cards, not raw Kanban pings."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="V37-P8 readable feed smoke", assignee="kopawk")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb._append_event(
+            conn,
+            tid,
+            "completed",
+            {
+                "kopa_workflow_feed": {
+                    "event_type": "closeout_or_partial_closeout",
+                    "summary": "runtime Kanban notifier 已渲染易读 workflow card",
+                    "hierarchy": {
+                        "version": "v0.3.7-alpha",
+                        "milestone": "Founder-visible Workflow Progress Feed",
+                        "package": "V37-P8",
+                        "task": "runtime-adoption-smoke",
+                    },
+                    "owner": "kopawk / Workflow Keeper",
+                    "next_step": "记录 message_id 并关闭 runtime adoption smoke gate",
+                    "boundary": "只证明本次 runtime notifier smoke；不是完整发布或验收",
+                    "claim_boundary": {
+                        "version_delivered": False,
+                        "deployed_live": False,
+                        "founder_accepted_live_outcome": False,
+                    },
+                }
+            },
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_called_once()
+    call_msg = fake_adapter.send.call_args[0][1]
+    assert call_msg.startswith("✅ Gate Closeout：")
+    assert "做什么：runtime Kanban notifier 已渲染易读 workflow card" in call_msg
+    assert "归属：v0.3.7-alpha → Founder-visible Workflow Progress Feed → V37-P8 → runtime-adoption-smoke" in call_msg
+    assert "Owner：kopawk / Workflow Keeper" in call_msg
+    assert "Kanban t_" not in call_msg
+    assert "deployed-live" not in call_msg
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
 async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     """

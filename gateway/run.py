@@ -4492,6 +4492,90 @@ class GatewayRunner:
         except Exception:
             return "default"
 
+    def _format_kopa_workflow_feed_card(self, event_payload: Any, task: Any = None, kind: str = "") -> str | None:
+        """Render Kopa readable workflow cards for annotated Kanban events.
+
+        Generic Kanban tasks deliberately fall through to the legacy notifier
+        strings. Kopa adoption is opt-in via an event payload field so this
+        runtime patch is safe for existing boards and non-Kopa users.
+        """
+        if not isinstance(event_payload, dict):
+            return None
+        feed = (
+            event_payload.get("kopa_workflow_feed")
+            or event_payload.get("workflow_progress_feed")
+            or event_payload.get("workflow_progress_event")
+        )
+        if not isinstance(feed, dict):
+            return None
+
+        event_type = str(feed.get("event_type") or "").strip()
+        if not event_type:
+            event_type = {
+                "completed": "closeout_or_partial_closeout",
+                "blocked": "blocker_or_decision_needed",
+                "gave_up": "blocker_or_decision_needed",
+                "crashed": "blocker_or_decision_needed",
+                "timed_out": "blocker_or_decision_needed",
+            }.get(kind, "progress_update")
+        labels = {
+            "intake_received": "📥 已收到",
+            "scope_locked": "📌 范围已锁定",
+            "dispatch_planned": "🚦 已分派",
+            "builder_started": "🔧 Builder 开始",
+            "progress_update": "🔎 有进展",
+            "handoff_to_review": "🤝 已交 Review",
+            "review_started": "🧪 Review 开始",
+            "review_result": "🧪 Review 结果",
+            "blocker_or_decision_needed": "⛔ 需要决策",
+            "closeout_or_partial_closeout": "✅ Gate Closeout",
+            "retrospective": "📚 复盘",
+            "learning_routed": "📌 学习已路由",
+        }
+        label = labels.get(event_type)
+        if not label:
+            return None
+
+        hierarchy = feed.get("hierarchy")
+        if not isinstance(hierarchy, dict):
+            return None
+        required_hierarchy = ("version", "milestone", "package", "task")
+        if any(not str(hierarchy.get(field) or "").strip() for field in required_hierarchy):
+            return None
+
+        summary = str(feed.get("summary") or "").strip()
+        owner = str(feed.get("owner") or getattr(task, "assignee", "") or "").strip()
+        next_step = str(feed.get("next_step") or "").strip()
+        boundary = str(feed.get("boundary") or "").strip()
+        if not all((summary, owner, next_step, boundary)):
+            return None
+
+        claim_boundary = feed.get("claim_boundary")
+        if isinstance(claim_boundary, dict):
+            for field in ("version_delivered", "deployed_live", "founder_accepted_live_outcome"):
+                if claim_boundary.get(field) is True:
+                    return None
+
+        scope = " → ".join(str(hierarchy[field]).strip() for field in required_hierarchy)
+        card = "\n".join([
+            f"{label}：{summary}",
+            "",
+            f"做什么：{summary}",
+            f"归属：{scope}",
+            f"Owner：{owner}",
+            f"下一步：{next_step}",
+            f"⚠️ 边界：{boundary}",
+        ])
+        forbidden = (
+            "{", "}", "```json", "```yaml", "Traceback", "/home/", "C:\\\\",
+            "All done, live now", "version delivered", "V delivered",
+            "release-ready", "deployed-live", "整个 V 已交付", "版本已交付",
+            "已上线", "Founder accepted",
+        )
+        if any(fragment in card for fragment in forbidden):
+            return None
+        return card
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -4679,12 +4763,19 @@ class GatewayRunner:
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
+                        msg = self._format_kopa_workflow_feed_card(
+                            getattr(ev, "payload", None), task=task, kind=kind
+                        )
+                        if msg is not None:
+                            pass
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if msg is not None:
+                            pass
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -4740,12 +4831,27 @@ class GatewayRunner:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
+                            send_result = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                            message_id = getattr(send_result, "message_id", None)
+                            raw_response = getattr(send_result, "raw_response", None)
+                            requested_thread_id = None
+                            delivered_thread_id = None
+                            if isinstance(raw_response, dict):
+                                requested_thread_id = raw_response.get("requested_thread_id")
+                                delivered_thread_id = raw_response.get("delivered_thread_id")
+                            logger.info(
+                                "kanban notifier: delivered %s event for %s to %s/%s thread=%s "
+                                "message_id=%s delivered_thread_id=%s board=%s",
+                                kind,
+                                sub["task_id"],
+                                platform_str,
+                                sub["chat_id"],
+                                requested_thread_id if requested_thread_id is not None else (sub.get("thread_id") or ""),
+                                message_id,
+                                delivered_thread_id,
+                                board_slug,
                             )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
