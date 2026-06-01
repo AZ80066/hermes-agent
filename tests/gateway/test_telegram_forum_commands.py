@@ -9,13 +9,13 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 
 
-def _make_test_adapter():
+def _make_test_adapter(extra=None):
     """Build a TelegramAdapter without running __init__."""
     from gateway.platforms.telegram import TelegramAdapter
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
-    adapter.config = PlatformConfig(enabled=True, token="***", extra={})
+    adapter.config = PlatformConfig(enabled=True, token="***", extra=extra or {})
     # ``name`` is a property derived from platform.value.title()
     adapter._bot = MagicMock()
     adapter._bot.set_my_commands = AsyncMock()
@@ -78,16 +78,42 @@ async def test_ensure_forum_commands_registers_once():
     assert -123 in adapter._forum_command_registered
     adapter._bot.set_my_commands.assert_awaited_once()
     args, kwargs = adapter._bot.set_my_commands.call_args
-    assert len(args[0]) == 6  # Kopa read-only commands + kopa_decision plus two BotCommand instances
-    assert [cmd.name for cmd in args[0][:4]] == [
-        "kopa_status",
-        "kopa_version",
-        "kopa_queue",
-        "kopa_decision",
-    ]
+    assert len(args[0]) == 2
+    assert [cmd.name for cmd in args[0]] == ["new", "help"]
     assert kwargs["scope"] is not None
     assert isinstance(kwargs["scope"].chat_id, int)
     assert kwargs["scope"].chat_id == -123
+
+
+@pytest.mark.asyncio
+async def test_ensure_forum_commands_includes_configured_routes_before_core_commands():
+    adapter = _make_test_adapter(extra={
+        "telegram_routes": {
+            "command_routes": {
+                "kopa_status": {"description": "Kopa current status", "handler": {"type": "subprocess", "argv": ["python3", "adapter.py"]}},
+                "kopa_queue": {"description": "Kopa queue", "handler": {"type": "subprocess", "argv": ["python3", "adapter.py"]}},
+            }
+        }
+    })
+    msg = _forum_message(chat_id=-321, is_forum=True)
+
+    with patch("hermes_cli.commands.telegram_menu_commands") as mock_menu:
+        mock_menu.return_value = ([("new", "Start new session"), ("kopa_status", "Old hardcoded copy")], 0)
+        with patch("telegram.BotCommand") as MockBotCommand:
+            def _make_cmd(name, desc):
+                cmd = MagicMock()
+                cmd.name = name
+                cmd.description = desc
+                return cmd
+
+            MockBotCommand.side_effect = _make_cmd
+            with patch("telegram.BotCommandScopeChat") as MockScope:
+                MockScope.side_effect = lambda chat_id: SimpleNamespace(chat_id=chat_id)
+                await adapter._ensure_forum_commands(msg)
+
+    args, _ = adapter._bot.set_my_commands.call_args
+    assert [cmd.name for cmd in args[0][:3]] == ["kopa_status", "kopa_queue", "new"]
+    assert args[0][0].description == "Kopa current status"
 
 
 @pytest.mark.asyncio
