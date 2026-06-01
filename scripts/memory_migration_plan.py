@@ -31,7 +31,7 @@ def target_for(item: dict) -> dict:
     if classification == "move_to_repo_workfeed_vault" or suggested == "issue_workfeed":
         return {
             "target_surface": "repo_workfeed_or_vault",
-            "target_path": "Kopa work/evidence, GitHub Issue/WorkFeed, or private vault after sensitivity review",
+            "target_path": "Project work/evidence, issue/workfeed, or private vault after sensitivity review",
             "apply_mode": "proposal_only",
         }
     if classification == "compress_merge":

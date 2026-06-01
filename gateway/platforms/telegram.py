@@ -1735,6 +1735,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload size limit (~4KB total).  Limit to 30 core commands
                 # to stay well under the threshold while covering all categories.
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                configured_commands = self._configured_telegram_menu_commands()
+                configured_names = {name for name, _ in configured_commands}
+                menu_commands = configured_commands + [
+                    (name, desc) for name, desc in menu_commands if name not in configured_names
+                ]
+                menu_commands = menu_commands[:MAX_COMMANDS_PER_SCOPE]
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -3239,6 +3245,23 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        configured_callback_route = self._configured_callback_route_for(data)
+        if configured_callback_route is not None:
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ 未授权")
+                return
+            await self._handle_configured_telegram_callback_route(
+                query, data, configured_callback_route, query_thread_id=query_thread_id
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -3552,6 +3575,211 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Generic configured Telegram route adapters
+    # ------------------------------------------------------------------
+
+    def _configured_telegram_routes(self) -> Dict[str, Any]:
+        """Return generic Telegram command/callback route config.
+
+        Shape (under platform extra):
+            command_routes:
+              status:
+                description: "..."
+                show_in_menu: true
+                handler:
+                  type: subprocess
+                  argv: ["python3", "/path/to/adapter.py"]
+                  cwd: "/repo"
+            callback_routes:
+              - prefix: "app:"
+                handler: {type: subprocess, argv: [...], cwd: "..."}
+        """
+        extra = self.config.extra if getattr(self.config, "extra", None) else {}
+        routes = extra.get("telegram_routes") or {}
+        if not isinstance(routes, dict):
+            routes = {}
+        # Backward-compatible flat keys for operators that do not want a
+        # telegram_routes wrapper.
+        command_routes = routes.get("command_routes", extra.get("command_routes", {}))
+        callback_routes = routes.get("callback_routes", extra.get("callback_routes", []))
+        return {
+            "command_routes": command_routes if isinstance(command_routes, dict) else {},
+            "callback_routes": callback_routes if isinstance(callback_routes, list) else [],
+        }
+
+    def _configured_telegram_menu_commands(self) -> List[tuple[str, str]]:
+        commands: List[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw_name, route in self._configured_telegram_routes()["command_routes"].items():
+            if not isinstance(route, dict):
+                continue
+            if route.get("show_in_menu", True) is False:
+                continue
+            name = str(raw_name or "").strip().lstrip("/").lower()
+            if not name or name in seen:
+                continue
+            desc = str(route.get("description") or route.get("desc") or "Configured Telegram command route")
+            commands.append((name, desc[:256]))
+            seen.add(name)
+        return commands
+
+    def _configured_command_route_for(self, text: str) -> Optional[tuple[str, Dict[str, Any]]]:
+        token = (text or "").strip().split()[0].split("@", 1)[0].lstrip("/").lower()
+        if not token:
+            return None
+        for raw_name, route in self._configured_telegram_routes()["command_routes"].items():
+            if not isinstance(route, dict):
+                continue
+            names = {str(raw_name or "").strip().lstrip("/").lower()}
+            names.update(str(a or "").strip().lstrip("/").lower() for a in route.get("aliases", []) if a)
+            if token in names:
+                return token, route
+        return None
+
+    def _configured_callback_route_for(self, data: str) -> Optional[Dict[str, Any]]:
+        for route in self._configured_telegram_routes()["callback_routes"]:
+            if not isinstance(route, dict):
+                continue
+            prefix = str(route.get("prefix") or "")
+            exact = str(route.get("exact") or "")
+            if exact and data == exact:
+                return route
+            if prefix and data.startswith(prefix):
+                return route
+        return None
+
+    def _telegram_route_payload_from_message(self, msg: Any, *, route_type: str, callback_data: str | None = None) -> Dict[str, Any]:
+        text = getattr(msg, "text", "") or ""
+        token = text.strip().split()[0].split("@", 1)[0] if text.strip() else ""
+        return {
+            "schema_version": "telegram_route_envelope_v1",
+            "route_type": route_type,
+            "platform": "telegram",
+            "text": text,
+            "command": token.lstrip("/").lower(),
+            "args": text.strip().split(maxsplit=1)[1] if len(text.strip().split(maxsplit=1)) > 1 else "",
+            "callback_data": callback_data,
+            "chat_id": getattr(msg, "chat_id", None),
+            "thread_id": getattr(msg, "message_thread_id", None),
+            "message_id": getattr(msg, "message_id", None),
+        }
+
+    async def _run_configured_telegram_route(self, route: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        handler = route.get("handler", route)
+        if not isinstance(handler, dict):
+            raise ValueError("configured Telegram route handler must be a mapping")
+        if handler.get("type", "subprocess") != "subprocess":
+            raise ValueError(f"unsupported Telegram route handler type: {handler.get('type')}")
+        argv = handler.get("argv") or handler.get("command")
+        if isinstance(argv, str):
+            argv = [argv]
+        if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
+            raise ValueError("configured Telegram subprocess route requires non-empty argv list")
+        timeout = float(handler.get("timeout_seconds", 10))
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=handler.get("cwd") or None,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise TimeoutError(f"configured Telegram route timed out after {timeout:g}s")
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"configured Telegram route exited {proc.returncode}: {err[:500]}")
+        raw = stdout.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return {"text": ""}
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            result = {"text": raw}
+        if not isinstance(result, dict):
+            result = {"text": str(result)}
+        return result
+
+    def _reply_markup_from_route_result(self, result: Dict[str, Any]) -> Any:
+        markup = result.get("reply_markup")
+        if not isinstance(markup, dict):
+            return None
+        keyboard = markup.get("inline_keyboard")
+        if not isinstance(keyboard, list):
+            return None
+        rows = []
+        for row in keyboard:
+            if not isinstance(row, list):
+                continue
+            buttons = []
+            for item in row:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "")
+                data = str(item.get("callback_data") or "")
+                if text and data:
+                    buttons.append(InlineKeyboardButton(text, callback_data=data))
+            if buttons:
+                rows.append(buttons)
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    async def _send_configured_telegram_command_route(self, msg: Any, route: Dict[str, Any]) -> Any:
+        if not self._bot:
+            return None
+        payload = self._telegram_route_payload_from_message(msg, route_type="command")
+        try:
+            result = await self._run_configured_telegram_route(route, payload)
+            text = str(result.get("text") or "")
+            if not text:
+                return None
+        except Exception as exc:
+            logger.error("Configured Telegram command route failed: %s", exc, exc_info=True)
+            text = "\n".join([
+                "⛔ 已阻塞：配置化 Telegram 命令路由失败",
+                "⚠️ 边界：未输出业务卡；不声明 runtime/TG 成功。",
+                "➡️ 下一步：检查 route handler 配置与 adapter 输出。",
+            ])
+            result = {}
+        kwargs: Dict[str, Any] = {"chat_id": int(msg.chat_id), "text": text, **self._link_preview_kwargs()}
+        reply_markup = self._reply_markup_from_route_result(result)
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        thread_id = getattr(msg, "message_thread_id", None)
+        if thread_id is not None:
+            kwargs.update(self._thread_kwargs_for_send(str(msg.chat_id), str(thread_id), {"thread_id": str(thread_id)}, reply_to_mode=self._reply_to_mode))
+        return await self._send_message_with_thread_fallback(**kwargs)
+
+    async def _handle_configured_telegram_callback_route(self, query: Any, data: str, route: Dict[str, Any], *, query_thread_id: Any) -> None:
+        message = getattr(query, "message", None)
+        if not self._bot or message is None:
+            return
+        payload = self._telegram_route_payload_from_message(message, route_type="callback", callback_data=data)
+        try:
+            result = await self._run_configured_telegram_route(route, payload)
+        except Exception as exc:
+            logger.error("Configured Telegram callback route failed: %s", exc, exc_info=True)
+            await query.answer(text="⛔ 路由失败")
+            return
+        answer_text = str(result.get("answer_text") or result.get("callback_answer") or "已处理")
+        await query.answer(text=answer_text[:200])
+        text = str(result.get("text") or "")
+        if not text:
+            return
+        kwargs: Dict[str, Any] = {"chat_id": int(message.chat_id), "text": text, **self._link_preview_kwargs()}
+        reply_markup = self._reply_markup_from_route_result(result)
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if query_thread_id is not None:
+            kwargs.update(self._thread_kwargs_for_send(str(message.chat_id), str(query_thread_id), {"thread_id": str(query_thread_id)}, reply_to_mode=self._reply_to_mode))
+        await self._send_message_with_thread_fallback(**kwargs)
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback
@@ -5043,6 +5271,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands
                 menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                configured_commands = self._configured_telegram_menu_commands()
+                configured_names = {name for name, _ in configured_commands}
+                menu_commands = configured_commands + [
+                    (name, desc) for name, desc in menu_commands if name not in configured_names
+                ]
+                menu_commands = menu_commands[:MAX_COMMANDS_PER_SCOPE]
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -5085,6 +5319,13 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        configured_route = self._configured_command_route_for(msg.text)
+        if configured_route is not None:
+            if not self._should_process_message(msg, is_command=True):
+                return
+            await self._ensure_forum_commands(msg)
+            await self._send_configured_telegram_command_route(msg, configured_route[1])
             return
         if not self._should_process_message(msg, is_command=True):
             return
